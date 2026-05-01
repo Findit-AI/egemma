@@ -1,48 +1,118 @@
 [package]
-name = "template-rs"
-version = "0.0.0"
-edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
-description = "A template for creating Rust open-source repo on GitHub"
-license = "MIT OR Apache-2.0"
-rust-version = "1.73"
-
-[[bench]]
-path = "benches/foo.rs"
-name = "foo"
-harness = false
-
-[features]
-default = ["std"]
-alloc = []
-std = []
+name         = "egemma"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.95"
+description  = "Rust ONNX inference library for Google's EmbeddingGemma (text embeddings)"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/Findit-AI/egemma"
+keywords     = ["embedding-gemma", "gemma", "embedding", "onnx", "ml"]
+categories   = ["science"]
+include = [
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE-*",
+]
 
 [dependencies]
+# `ort` and `tokenizers` are gated on the `inference` feature so the
+# crate compiles for wasm32 (where neither builds today — `ort` needs
+# native ONNX Runtime FFI and `tokenizers` pulls `onig_sys` /
+# `esaxx-rs` which lack wasm targets). Without `inference` the crate
+# exposes the `Embedding` type, the `Options` surface, and the error
+# enum — useful in environments where inference happens elsewhere.
+ort        = { version = "2.0.0-rc.12", optional = true }
+tokenizers = { version = "0.23", optional = true }
+thiserror  = "2"
+# `serde` is opt-in: most consumers use `egemma` purely as an inference
+# library and don't need to (de)serialize `Options`. Pulling serde
+# unconditionally adds compile time and binary size for no benefit on
+# the common path. Mirrors the `silero` pattern — gate the dependency,
+# the `derive(Serialize, Deserialize)` calls, and every field-level
+# `#[serde(...)]` attribute on `feature = "serde"`.
+serde      = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
-criterion = "0.8"
-tempfile = "3"
+serde_json = "1"
+tempfile   = "3"
+
+# =====================================================================
+# Target / feature contract.
+#
+# Default features include `inference`, which pulls `ort` + `tokenizers`.
+# Both require native build scripts (`ort` needs ONNX Runtime FFI;
+# `tokenizers` pulls `onig_sys` / `esaxx-rs`, which fail on wasm32
+# because their C deps don't have wasm targets).
+#
+# **Wasm builds must use `--no-default-features`.** Building wasm with
+# default features fails inside `getrandom` / `onig_sys` long before
+# this crate's code is ever touched, with a confusing C-toolchain
+# error. The `--no-default-features` build compiles the `Embedding`,
+# `Options`, and `Error` subset — useful when inference happens
+# elsewhere (a server, a different runtime). This mirrors the
+# `siglip2` pattern: native = inference by default; wasm = explicit
+# opt-out, no-inference subset.
+#
+# CI / build-matrix consumers: gate the wasm job on
+# `--no-default-features`, e.g.
+# `cargo check --target wasm32-unknown-unknown --no-default-features`.
+# =====================================================================
+[features]
+default   = ["inference"]
+# Activates the ONNX-backed inference path (`TextEncoder`). Native
+# targets only — see the target / feature contract block above for the
+# wasm escape hatch.
+inference = ["dep:ort", "dep:tokenizers"]
+# Pulls the `serde` dependency and activates `Serialize` / `Deserialize`
+# on `Options`, `BatchOptions`, and `ThreadOptions`. `Embedding`
+# deliberately does NOT carry these derives — round-trip via the inner
+# slice (see `Embedding` docs) so the dim and L2-norm invariants that
+# `TryFrom<Vec<f32>>` exists to enforce can't be bypassed.
+serde     = ["dep:serde"]
+
+# ----- Opt-in execution providers --------------------------------------
+#
+# Feature names mirror ort's own EP feature flags so a downstream
+# consumer can reason about both crates with the same vocabulary
+# (`egemma/cuda` ↔ `ort/cuda`, etc.). Each feature activates the
+# corresponding ort sub-feature so the prebuilt ONNX Runtime that
+# gets linked includes that EP, and `session::build_session`
+# cfg-registers the EP at session-build time. None are enabled by
+# default — see `siglip2/Cargo.toml` for the measurement methodology.
+cuda     = ["inference", "ort/cuda"]
+tensorrt = ["inference", "ort/tensorrt"]
+directml = ["inference", "ort/directml"]
+rocm     = ["inference", "ort/rocm"]
+coreml   = ["inference", "ort/coreml"]
+
+[[test]]
+name              = "integration"
+path              = "tests/integration.rs"
+required-features = ["inference"]
+
+[[example]]
+name              = "embed_text"
+path              = "examples/embed_text.rs"
+required-features = ["inference"]
 
 [profile.bench]
-opt-level = 3
-debug = false
-codegen-units = 1
-lto = 'thin'
-incremental = false
-debug-assertions = false
-overflow-checks = false
-rpath = false
+opt-level         = 3
+debug             = false
+codegen-units     = 1
+lto               = 'thin'
+incremental       = false
+debug-assertions  = false
+overflow-checks   = false
+rpath             = false
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
-rust_2018_idioms = "warn"
+rust_2018_idioms     = "warn"
 single_use_lifetimes = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = [
-  'cfg(all_tests)',
-  'cfg(tarpaulin)',
-] }
+unexpected_cfgs      = { level = "warn", check-cfg = ['cfg(all_tests)', 'cfg(tarpaulin)', 'cfg(docsrs)'] }
