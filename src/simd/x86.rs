@@ -79,24 +79,14 @@ pub(crate) unsafe fn dot_768_avx2_fma(a: &[f32; 768], b: &[f32; 768]) -> f32 {
 mod tests {
   use super::*;
 
-  /// Detect AVX2+FMA on the current host. Returns `true` if both
-  /// features are present, otherwise prints a `[SIMD-SKIP]` banner
-  /// and returns `false` so the caller can early-out with `Ok(())`.
-  ///
-  /// **Why skip rather than panic.** The production dispatcher
-  /// supports non-AVX2 x86_64 hosts via the scalar fallback (see
-  /// `simd::dot_768_dispatch` for x86_64). Panicking here would
-  /// break `cargo test` on a configuration the library officially
-  /// handles — a real CI/contributor problem on virtualized envs
-  /// or older hardware.
-  ///
-  /// **What still covers the kernel.** GitHub Actions Linux x86_64
-  /// runners (Skylake+) have AVX2+FMA, so the `test` job exercises
-  /// these tests for real. The scalar fallback is independently
-  /// covered by `simd::scalar::tests` regardless of host. Codex's
-  /// previous-round critique of "silent skip masks lack of
-  /// coverage" is mitigated by the `[SIMD-SKIP]` banner — CI logs
-  /// are searchable to verify which runs hit the kernel.
+  /// Returns `true` if AVX2+FMA are both detected on the current
+  /// host; otherwise prints a `[SIMD-SKIP]` banner and returns
+  /// `false`. Skip-not-panic: the dispatcher supports non-AVX2
+  /// x86_64 via the scalar fallback (see `simd::dot_768_dispatch`),
+  /// so panicking here would fail `cargo test` on a configuration
+  /// the library handles. CI Linux x86_64 runners have AVX2+FMA,
+  /// which is where the kernel coverage actually fires; the banner
+  /// is grep-able to verify in CI logs.
   fn avx2_fma_available() -> bool {
     let ok =
       std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");

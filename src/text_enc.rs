@@ -277,23 +277,16 @@ fn validate_text_session(session: &ort::session::Session) -> Result<()> {
 
 /// Verify an `Outlet` exists with the expected dtype and shape.
 ///
-/// `expected_shape` semantics — match `siglip2::check_outlet`:
+/// `expected_shape` semantics:
 ///
-/// - `-1` in `expected_shape` means **the graph MUST declare this axis
-///   dynamic**. A static dim there is rejected. This is what we want
-///   for `input_ids` / `attention_mask`: `embed_chunk` sends batches
-///   of `[group.len(), BatchLongest seq_len]` where neither dim is
-///   known at session-build time, so a graph baking in `[1, 2048]`
-///   or `[8, 512]` would fail at first `Session::run` — surface that
-///   at construction time instead.
-/// - any other value in `expected_shape` is an **exact match**
-///   requirement. The graph may either match exactly or declare the
-///   axis dynamic (`-1`); both work at runtime.
-///
-/// The previous wildcard semantics (where `-1` meant "any dim
-/// acceptable") let static-shape exports load successfully and only
-/// failed at first inference call — Codex finding [medium]:
-/// `check_outlet` accepted incompatible static shapes.
+/// - `-1` means **the graph MUST declare this axis dynamic**. A static
+///   dim there is rejected. `embed_chunk` sends batches of
+///   `[group.len(), BatchLongest seq_len]` where neither dim is known
+///   at session-build time, so a graph baking in `[1, 2048]` or
+///   `[8, 512]` would fail at first `Session::run`.
+/// - any other value is an **exact match** requirement. The graph may
+///   either match exactly or declare the axis dynamic (`-1`); both
+///   work at runtime.
 fn check_outlet(
   outlets: &[ort::value::Outlet],
   name: &'static str,
@@ -418,15 +411,12 @@ mod tests {
     assert_eq!(EMBED_DIM, 768);
   }
 
-  /// Codex review finding: `embed_batch` documents that failures
-  /// surface as `Error::Batch { index, source }` carrying the
-  /// offending zero-based index, but the previous implementation
-  /// propagated `Embedding::from_model_output` errors unwrapped via
-  /// `?` — so a degenerate row in the middle of a batch would lose
-  /// its position. This test fakes a 3-row chunk where the middle row
-  /// is all zero (→ `NotNormalized`) and asserts the wrapped index is
-  /// `base_index + 1`, proving the row context is preserved across
-  /// the boundary.
+  /// `embed_batch` documents that failures surface as
+  /// `Error::Batch { index, source }` carrying the offending zero-based
+  /// index. Pin: a degenerate row (here, all-zero → `NotNormalized`)
+  /// in the middle of a batch must have its position preserved across
+  /// the `embeddings_from_chunk` boundary instead of bubbling up as a
+  /// bare `NotNormalized`.
   #[test]
   fn embeddings_from_chunk_wraps_row_error_with_index() {
     // 3 rows × 768. Rows 0 and 2 are unit vectors (normalize fine);
