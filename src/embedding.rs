@@ -54,9 +54,10 @@ impl Embedding {
   /// only reachable in-crate; the check is forward-compatibility for
   /// variable-dim embeddings and a guard against future internal misuse.
   ///
-  /// Internally dispatches through [`crate::simd::dot_768`] — picks NEON
-  /// on aarch64, AVX2+FMA on x86_64 (when the runtime CPU advertises
-  /// both), or a four-accumulator scalar fallback on every other target.
+  /// Internally dispatches through the crate-private SIMD layer — picks
+  /// NEON on aarch64, AVX2+FMA on x86_64 (when the runtime CPU
+  /// advertises both), or a four-accumulator scalar fallback on every
+  /// other target.
   pub fn try_cosine(&self, other: &Embedding) -> Result<f32> {
     if self.dim() != other.dim() {
       return Err(Error::EmbeddingDim {

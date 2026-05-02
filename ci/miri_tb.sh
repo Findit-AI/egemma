@@ -35,4 +35,12 @@ cargo miri setup
 
 export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-symbolic-alignment-check -Zmiri-tree-borrows"
 
-cargo miri test --all-targets --target "$TARGET"
+# Miri can't evaluate the FFI in `ort` / `tokenizers` (the `inference`
+# default-feature dependencies), and most of the matrix targets
+# (powerpc64, s390x, riscv64, i686) have no ort prebuilds. With
+# `--no-default-features` Miri exercises the embedding + options + simd
+# subset it actually validates: the SIMD dispatcher routes through the
+# scalar fallback under `cfg!(miri)`, so the unsafe NEON / AVX2 kernel
+# boundaries are indirectly covered through `Embedding::try_cosine`
+# without ever entering the platform intrinsics Miri can't model.
+cargo miri test --all-targets --no-default-features --target "$TARGET"

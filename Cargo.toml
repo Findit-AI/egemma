@@ -109,7 +109,14 @@ overflow-checks   = false
 rpath             = false
 
 [package.metadata.docs.rs]
-all-features = true
+# `all-features = true` would activate the opt-in execution-provider
+# features (`cuda`, `tensorrt`, `directml`, `rocm`, `coreml`), each of
+# which requires the corresponding vendor SDK at build time. docs.rs's
+# Linux builder doesn't have any of them, so `all-features` would fail
+# the docs build even when the actual code on docs.rs is fine. List
+# the features that compile on a stock Linux runner; EP-specific docs
+# coverage would need a separately provisioned builder.
+features = ["inference", "serde"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]

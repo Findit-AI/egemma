@@ -35,4 +35,9 @@ cargo miri setup
 
 export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-symbolic-alignment-check"
 
-cargo miri test --all-targets --target "$TARGET"
+# See `ci/miri_tb.sh` for why `--no-default-features` is required:
+# Miri can't evaluate ort / tokenizers FFI, and the SIMD dispatcher's
+# `cfg!(miri)` short-circuit routes through scalar so the unsafe
+# NEON / AVX2 kernel boundaries are covered indirectly through the
+# embedding API without entering platform intrinsics.
+cargo miri test --all-targets --no-default-features --target "$TARGET"
