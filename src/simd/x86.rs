@@ -79,21 +79,35 @@ pub(crate) unsafe fn dot_768_avx2_fma(a: &[f32; 768], b: &[f32; 768]) -> f32 {
 mod tests {
   use super::*;
 
-  /// AVX2+FMA must be available on any x86_64 host that runs these
-  /// tests. If a contributor's runner lacks it, fail loudly rather
-  /// than silently passing — the unsafe SIMD code is what these tests
-  /// are *for*, and a skip-on-missing-feature was masking the lack of
-  /// coverage on non-AVX hosts (Codex finding [medium]: AVX2 backend
-  /// test could silently skip). x86_64 baselines in any CI runner
-  /// since ~2013 (Haswell+) have both; if this panics on a real
-  /// machine, the host is too old to test on.
-  fn require_avx2_fma() {
-    assert!(
-      std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma"),
-      "x86_64 SIMD tests require AVX2+FMA on the runner; this host has neither — skipping is \
-       not safe because the unsafe `dot_768_avx2_fma` kernel would otherwise have zero \
-       direct test coverage. Run on a Haswell-or-later x86_64 host.",
-    );
+  /// Detect AVX2+FMA on the current host. Returns `true` if both
+  /// features are present, otherwise prints a `[SIMD-SKIP]` banner
+  /// and returns `false` so the caller can early-out with `Ok(())`.
+  ///
+  /// **Why skip rather than panic.** The production dispatcher
+  /// supports non-AVX2 x86_64 hosts via the scalar fallback (see
+  /// `simd::dot_768_dispatch` for x86_64). Panicking here would
+  /// break `cargo test` on a configuration the library officially
+  /// handles — a real CI/contributor problem on virtualized envs
+  /// or older hardware.
+  ///
+  /// **What still covers the kernel.** GitHub Actions Linux x86_64
+  /// runners (Skylake+) have AVX2+FMA, so the `test` job exercises
+  /// these tests for real. The scalar fallback is independently
+  /// covered by `simd::scalar::tests` regardless of host. Codex's
+  /// previous-round critique of "silent skip masks lack of
+  /// coverage" is mitigated by the `[SIMD-SKIP]` banner — CI logs
+  /// are searchable to verify which runs hit the kernel.
+  fn avx2_fma_available() -> bool {
+    let ok =
+      std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
+    if !ok {
+      eprintln!(
+        "[SIMD-SKIP] AVX2/FMA unavailable on this x86_64 host — direct kernel tests skipped. \
+         The dispatcher's scalar fallback handles this configuration; CI Linux x86_64 runners \
+         exercise the AVX2 kernel separately."
+      );
+    }
+    ok
   }
 
   fn boxed_array(f: impl Fn(usize) -> f32) -> Box<[f32; 768]> {
@@ -110,7 +124,9 @@ mod tests {
   /// test in `simd::tests`.
   #[test]
   fn agrees_with_scalar_within_tolerance() {
-    require_avx2_fma();
+    if !avx2_fma_available() {
+      return;
+    }
     let a = boxed_array(|i| ((i as f32) * 0.013).sin());
     let b = boxed_array(|i| ((i as f32) * 0.017).cos());
     let s = crate::simd::scalar::dot_768(&a, &b);
@@ -125,7 +141,9 @@ mod tests {
   /// "no spurious accumulation" property bit-exactly (no tolerance).
   #[test]
   fn orthogonal_axes_dot_to_exact_zero() {
-    require_avx2_fma();
+    if !avx2_fma_available() {
+      return;
+    }
     let mut a = Box::new([0.0f32; 768]);
     let mut b = Box::new([0.0f32; 768]);
     a[0] = 1.0;
@@ -140,7 +158,9 @@ mod tests {
   /// contributes, no FP error from summation ordering.
   #[test]
   fn unit_vector_self_dot_is_one() {
-    require_avx2_fma();
+    if !avx2_fma_available() {
+      return;
+    }
     let mut a = Box::new([0.0f32; 768]);
     a[123] = 1.0;
     // SAFETY: AVX2+FMA asserted; type-encoded length.
@@ -153,7 +173,9 @@ mod tests {
   /// missing or double-counted lanes shows up here).
   #[test]
   fn constant_vectors_match_known_sum() {
-    require_avx2_fma();
+    if !avx2_fma_available() {
+      return;
+    }
     let a = Box::new([0.5f32; 768]);
     let b = Box::new([0.25f32; 768]);
     // 768 * 0.5 * 0.25 = 96.0
@@ -171,7 +193,9 @@ mod tests {
   /// past the all-positive trigonometric case.
   #[test]
   fn alternating_sign_agrees_with_scalar() {
-    require_avx2_fma();
+    if !avx2_fma_available() {
+      return;
+    }
     let a = boxed_array(|i| if i % 2 == 0 { 1.0 } else { -1.0 });
     let b = boxed_array(|i| if i % 3 == 0 { 1.0 } else { -1.0 });
     let s = crate::simd::scalar::dot_768(&a, &b);

@@ -277,11 +277,23 @@ fn validate_text_session(session: &ort::session::Session) -> Result<()> {
 
 /// Verify an `Outlet` exists with the expected dtype and shape.
 ///
-/// `expected_shape` semantics: a value of `-1` is a wildcard (matches any
-/// dim including the graph's own `-1` dynamic marker). Any other value
-/// must match exactly. The graph's declared shape may itself contain `-1`
-/// for dynamic axes; in that case we still accept it (the runtime will
-/// catch shape mismatches at inference time).
+/// `expected_shape` semantics — match `siglip2::check_outlet`:
+///
+/// - `-1` in `expected_shape` means **the graph MUST declare this axis
+///   dynamic**. A static dim there is rejected. This is what we want
+///   for `input_ids` / `attention_mask`: `embed_chunk` sends batches
+///   of `[group.len(), BatchLongest seq_len]` where neither dim is
+///   known at session-build time, so a graph baking in `[1, 2048]`
+///   or `[8, 512]` would fail at first `Session::run` — surface that
+///   at construction time instead.
+/// - any other value in `expected_shape` is an **exact match**
+///   requirement. The graph may either match exactly or declare the
+///   axis dynamic (`-1`); both work at runtime.
+///
+/// The previous wildcard semantics (where `-1` meant "any dim
+/// acceptable") let static-shape exports load successfully and only
+/// failed at first inference call — Codex finding [medium]:
+/// `check_outlet` accepted incompatible static shapes.
 fn check_outlet(
   outlets: &[ort::value::Outlet],
   name: &'static str,
@@ -318,12 +330,29 @@ fn check_outlet(
       }
       for (i, &want) in expected_shape.iter().enumerate() {
         let act = actual[i];
-        if want != -1 && act != -1 && act != want {
-          return Err(Error::SessionShapeMismatch {
-            input: name,
-            expected: "matching static dim",
-            got: actual.to_vec(),
-          });
+        if want == -1 {
+          // We require this axis to be dynamic. A graph baking in
+          // a concrete dim here would load successfully under the
+          // old wildcard semantics and only fail at `Session::run`
+          // when `embed_chunk` sends a different size.
+          if act != -1 {
+            return Err(Error::SessionShapeMismatch {
+              input: name,
+              expected: "dynamic axis (graph declares -1; static-shape \
+                         exports incompatible with chunked APIs)",
+              got: actual.to_vec(),
+            });
+          }
+        } else {
+          // Concrete dim required. Graph may match exactly or declare
+          // the axis dynamic — both work at runtime.
+          if act != -1 && act != want {
+            return Err(Error::SessionShapeMismatch {
+              input: name,
+              expected: "matching static dim",
+              got: actual.to_vec(),
+            });
+          }
         }
       }
       Ok(())
