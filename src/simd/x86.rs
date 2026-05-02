@@ -79,27 +79,107 @@ pub(crate) unsafe fn dot_768_avx2_fma(a: &[f32; 768], b: &[f32; 768]) -> f32 {
 mod tests {
   use super::*;
 
+  /// AVX2+FMA must be available on any x86_64 host that runs these
+  /// tests. If a contributor's runner lacks it, fail loudly rather
+  /// than silently passing — the unsafe SIMD code is what these tests
+  /// are *for*, and a skip-on-missing-feature was masking the lack of
+  /// coverage on non-AVX hosts (Codex finding [medium]: AVX2 backend
+  /// test could silently skip). x86_64 baselines in any CI runner
+  /// since ~2013 (Haswell+) have both; if this panics on a real
+  /// machine, the host is too old to test on.
+  fn require_avx2_fma() {
+    assert!(
+      std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma"),
+      "x86_64 SIMD tests require AVX2+FMA on the runner; this host has neither — skipping is \
+       not safe because the unsafe `dot_768_avx2_fma` kernel would otherwise have zero \
+       direct test coverage. Run on a Haswell-or-later x86_64 host.",
+    );
+  }
+
+  fn boxed_array(f: impl Fn(usize) -> f32) -> Box<[f32; 768]> {
+    (0..768)
+      .map(f)
+      .collect::<Vec<_>>()
+      .into_boxed_slice()
+      .try_into()
+      .expect("768 elements")
+  }
+
+  /// Compares the AVX2+FMA kernel against the scalar reference on
+  /// the trigonometric fixture used by the cross-backend agreement
+  /// test in `simd::tests`.
   #[test]
   fn agrees_with_scalar_within_tolerance() {
-    if !std::arch::is_x86_feature_detected!("avx2") || !std::arch::is_x86_feature_detected!("fma") {
-      eprintln!("skipping: AVX2/FMA not available on this host");
-      return;
-    }
-    let a: Box<[f32; 768]> = (0..768)
-      .map(|i| ((i as f32) * 0.013).sin())
-      .collect::<Vec<_>>()
-      .into_boxed_slice()
-      .try_into()
-      .unwrap();
-    let b: Box<[f32; 768]> = (0..768)
-      .map(|i| ((i as f32) * 0.017).cos())
-      .collect::<Vec<_>>()
-      .into_boxed_slice()
-      .try_into()
-      .unwrap();
+    require_avx2_fma();
+    let a = boxed_array(|i| ((i as f32) * 0.013).sin());
+    let b = boxed_array(|i| ((i as f32) * 0.017).cos());
     let s = crate::simd::scalar::dot_768(&a, &b);
-    // SAFETY: AVX2+FMA detected above; type-encoded length.
+    // SAFETY: AVX2+FMA asserted above; type-encoded length.
     let v = unsafe { dot_768_avx2_fma(&a, &b) };
-    assert!((s - v).abs() < 1e-3, "avx2+fma ({v}) vs scalar ({s})");
+    assert!((s - v).abs() < 1e-3, "avx2+fma ({v}) vs scalar ({s})",);
+  }
+
+  /// Orthogonal axis vectors → exact 0 dot product. Pin: SIMD
+  /// summation order can't introduce drift on inputs that are
+  /// identically zero outside one slot, so this checks the kernel's
+  /// "no spurious accumulation" property bit-exactly (no tolerance).
+  #[test]
+  fn orthogonal_axes_dot_to_exact_zero() {
+    require_avx2_fma();
+    let mut a = Box::new([0.0f32; 768]);
+    let mut b = Box::new([0.0f32; 768]);
+    a[0] = 1.0;
+    b[1] = 1.0;
+    // SAFETY: AVX2+FMA asserted; type-encoded length.
+    let v = unsafe { dot_768_avx2_fma(&a, &b) };
+    assert_eq!(v, 0.0, "orthogonal e0·e1 must be exactly 0; got {v}");
+  }
+
+  /// Self-dot of a unit-norm vector → exactly 1.0. Same bit-exact
+  /// reasoning as `orthogonal_axes_dot_to_exact_zero`: only one slot
+  /// contributes, no FP error from summation ordering.
+  #[test]
+  fn unit_vector_self_dot_is_one() {
+    require_avx2_fma();
+    let mut a = Box::new([0.0f32; 768]);
+    a[123] = 1.0;
+    // SAFETY: AVX2+FMA asserted; type-encoded length.
+    let v = unsafe { dot_768_avx2_fma(&a, &a) };
+    assert_eq!(v, 1.0, "unit-vector self-dot must be exactly 1.0; got {v}");
+  }
+
+  /// Constant-vector dot product: 768 × c × d. Catches FMA
+  /// accumulation bugs across the four chains (any chain
+  /// missing or double-counted lanes shows up here).
+  #[test]
+  fn constant_vectors_match_known_sum() {
+    require_avx2_fma();
+    let a = Box::new([0.5f32; 768]);
+    let b = Box::new([0.25f32; 768]);
+    // 768 * 0.5 * 0.25 = 96.0
+    // SAFETY: AVX2+FMA asserted; type-encoded length.
+    let v = unsafe { dot_768_avx2_fma(&a, &b) };
+    assert!(
+      (v - 96.0).abs() < 1e-4,
+      "expected 96.0 from 768·0.5·0.25; got {v}",
+    );
+  }
+
+  /// Alternating-sign fixture: catches a class of reduction bugs
+  /// where a chain accidentally swaps subtract/add or where signs
+  /// drop during horizontal reduce. Also widens the tolerance check
+  /// past the all-positive trigonometric case.
+  #[test]
+  fn alternating_sign_agrees_with_scalar() {
+    require_avx2_fma();
+    let a = boxed_array(|i| if i % 2 == 0 { 1.0 } else { -1.0 });
+    let b = boxed_array(|i| if i % 3 == 0 { 1.0 } else { -1.0 });
+    let s = crate::simd::scalar::dot_768(&a, &b);
+    // SAFETY: AVX2+FMA asserted; type-encoded length.
+    let v = unsafe { dot_768_avx2_fma(&a, &b) };
+    assert!(
+      (s - v).abs() < 1e-3,
+      "alternating-sign avx2 ({v}) vs scalar ({s})",
+    );
   }
 }
