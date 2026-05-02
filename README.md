@@ -140,3 +140,8 @@ See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 [EmbeddingGemma]: https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX
 [`ort`]: https://crates.io/crates/ort
 [`tokenizers`]: https://crates.io/crates/tokenizers
+[Github-url]: https://github.com/Findit-AI/egemma
+[CI-url]: https://github.com/Findit-AI/egemma/actions/workflows/ci.yml
+[doc-url]: https://docs.rs/egemma
+[crates-url]: https://crates.io/crates/egemma
+[codecov-url]: https://app.codecov.io/gh/Findit-AI/egemma

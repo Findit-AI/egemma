@@ -29,10 +29,16 @@ impl Embedding {
   /// L2-norm tolerance for the unit-norm invariant.
   pub const NORM_EPSILON: f32 = 5e-4;
 
+  /// Number of `f32` lanes in the embedding. Always [`Self::EMBED_DIM`]
+  /// (768) for any `Embedding` produced by this crate's public
+  /// constructors.
   pub fn dim(&self) -> usize {
     self.0.len()
   }
 
+  /// Borrowed view of the underlying `f32` data. Cheap (no copy) and
+  /// the standard input for downstream similarity / vector-store code
+  /// that wants a `&[f32]`.
   pub fn as_slice(&self) -> &[f32] {
     &self.0
   }

@@ -103,6 +103,10 @@ const fn default_max_batch_size() -> usize {
   1024
 }
 
+/// Sequence-length and batching policy for [`crate::TextEncoder`].
+/// Validated at encoder construction; see
+/// [`Self::with_max_seq_len`] / [`Self::with_batch_size`] /
+/// [`Self::with_max_batch_size`] for the tunables.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct BatchOptions {
@@ -115,6 +119,8 @@ pub struct BatchOptions {
 }
 
 impl BatchOptions {
+  /// Construct a `BatchOptions` with the crate defaults
+  /// (`max_seq_len = 2048`, `batch_size = 8`, `max_batch_size = 1024`).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
@@ -145,36 +151,45 @@ impl BatchOptions {
     self.max_batch_size
   }
 
+  /// Returns a copy with [`Self::max_seq_len`] replaced.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_max_seq_len(mut self, n: usize) -> Self {
     self.max_seq_len = n;
     self
   }
 
+  /// Returns a copy with [`Self::batch_size`] replaced.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_batch_size(mut self, n: usize) -> Self {
     self.batch_size = n;
     self
   }
 
+  /// Returns a copy with [`Self::max_batch_size`] replaced.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_max_batch_size(mut self, n: usize) -> Self {
     self.max_batch_size = n;
     self
   }
 
+  /// In-place setter for [`Self::max_seq_len`]; returns `&mut self`
+  /// so calls can chain.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_max_seq_len(&mut self, n: usize) -> &mut Self {
     self.max_seq_len = n;
     self
   }
 
+  /// In-place setter for [`Self::batch_size`]; returns `&mut self`
+  /// so calls can chain.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_batch_size(&mut self, n: usize) -> &mut Self {
     self.batch_size = n;
     self
   }
 
+  /// In-place setter for [`Self::max_batch_size`]; returns `&mut self`
+  /// so calls can chain.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_max_batch_size(&mut self, n: usize) -> &mut Self {
     self.max_batch_size = n;
@@ -225,6 +240,11 @@ const fn default_parallel_execution() -> bool {
   false
 }
 
+/// ORT thread-pool configuration. Maps onto ORT session-builder
+/// settings (`with_intra_threads` / `with_inter_threads` /
+/// `with_parallel_execution`). All defaults are `1` / `false`,
+/// matching ORT's CPU-friendly low-contention setup; tune up for
+/// high-throughput offline batches.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ThreadOptions {
@@ -237,6 +257,8 @@ pub struct ThreadOptions {
 }
 
 impl ThreadOptions {
+  /// Construct with crate defaults (1 intra-op thread, 1 inter-op
+  /// thread, parallel execution off).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
@@ -246,51 +268,65 @@ impl ThreadOptions {
     }
   }
 
+  /// Intra-op thread count — ORT's per-operator parallelism.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn intra_threads(&self) -> usize {
     self.intra_threads
   }
 
+  /// Inter-op thread count — ORT's between-operator parallelism.
+  /// Only meaningful when [`Self::parallel_execution`] is `true`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn inter_threads(&self) -> usize {
     self.inter_threads
   }
 
+  /// Whether ORT runs independent operators concurrently. Most
+  /// embedding workloads don't benefit; off by default.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn parallel_execution(&self) -> bool {
     self.parallel_execution
   }
 
+  /// Returns a copy with [`Self::intra_threads`] replaced.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_intra_threads(mut self, n: usize) -> Self {
     self.intra_threads = n;
     self
   }
 
+  /// Returns a copy with [`Self::inter_threads`] replaced.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_inter_threads(mut self, n: usize) -> Self {
     self.inter_threads = n;
     self
   }
 
+  /// Returns a copy with [`Self::parallel_execution`] replaced.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_parallel_execution(mut self, p: bool) -> Self {
     self.parallel_execution = p;
     self
   }
 
+  /// In-place setter for [`Self::intra_threads`]; returns `&mut self`
+  /// so calls can chain.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_intra_threads(&mut self, n: usize) -> &mut Self {
     self.intra_threads = n;
     self
   }
 
+  /// In-place setter for [`Self::inter_threads`]; returns `&mut self`
+  /// so calls can chain.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_inter_threads(&mut self, n: usize) -> &mut Self {
     self.inter_threads = n;
     self
   }
 
+  /// In-place setter for [`Self::parallel_execution`]; returns
+  /// `&mut self` so calls can chain.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_parallel_execution(&mut self, p: bool) -> &mut Self {
     self.parallel_execution = p;
@@ -305,6 +341,10 @@ impl Default for ThreadOptions {
   }
 }
 
+/// Top-level configuration passed to [`crate::TextEncoder`]
+/// constructors. Bundles ORT graph-optimization level
+/// (gated on `feature = "inference"`), [`BatchOptions`], and
+/// [`ThreadOptions`].
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Options {
@@ -321,6 +361,9 @@ pub struct Options {
 }
 
 impl Options {
+  /// Construct with crate defaults
+  /// (`Level1` optimization, default `BatchOptions`, default
+  /// `ThreadOptions`).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
@@ -331,22 +374,27 @@ impl Options {
     }
   }
 
+  /// ORT graph-optimization level applied at session-build time.
   #[cfg(feature = "inference")]
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn optimization_level(&self) -> GraphOptimizationLevel {
     self.optimization_level
   }
 
+  /// The nested [`BatchOptions`] for sequence-length and chunking
+  /// policy.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn batch(&self) -> BatchOptions {
     self.batch
   }
 
+  /// The nested [`ThreadOptions`] for ORT thread-pool tuning.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn threads(&self) -> ThreadOptions {
     self.threads
   }
 
+  /// Returns a copy with [`Self::optimization_level`] replaced.
   #[cfg(feature = "inference")]
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_optimization_level(mut self, l: GraphOptimizationLevel) -> Self {
@@ -354,18 +402,22 @@ impl Options {
     self
   }
 
+  /// Returns a copy with [`Self::batch`] replaced.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_batch(mut self, b: BatchOptions) -> Self {
     self.batch = b;
     self
   }
 
+  /// Returns a copy with [`Self::threads`] replaced.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn with_threads(mut self, t: ThreadOptions) -> Self {
     self.threads = t;
     self
   }
 
+  /// In-place setter for [`Self::optimization_level`]; returns
+  /// `&mut self` so calls can chain.
   #[cfg(feature = "inference")]
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_optimization_level(&mut self, l: GraphOptimizationLevel) -> &mut Self {
@@ -373,12 +425,16 @@ impl Options {
     self
   }
 
+  /// In-place setter for [`Self::batch`]; returns `&mut self` so
+  /// calls can chain.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_batch(&mut self, b: BatchOptions) -> &mut Self {
     self.batch = b;
     self
   }
 
+  /// In-place setter for [`Self::threads`]; returns `&mut self` so
+  /// calls can chain.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_threads(&mut self, t: ThreadOptions) -> &mut Self {
     self.threads = t;

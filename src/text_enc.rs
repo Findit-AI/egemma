@@ -48,6 +48,13 @@ impl TextEncoder {
     Self::from_ort_session_with_options(session, tokenizer, opts)
   }
 
+  /// Construct from a caller-built `ort::Session` and `Tokenizer`,
+  /// using the crate-default [`Options`]. Equivalent to calling
+  /// [`Self::from_ort_session_with_options`] with `Options::default()`.
+  /// On wasm32 this is the supported entry point because
+  /// `ort 2.0.0-rc.12` cfg-gates `commit_from_file` out of wasm
+  /// builds — wasm callers must build the `ort::Session` themselves
+  /// (e.g. via the wasm-specific async APIs) and pass it in.
   pub fn from_ort_session(session: ort::session::Session, tokenizer: Tokenizer) -> Result<Self> {
     Self::from_ort_session_with_options(session, tokenizer, Options::default())
   }
@@ -72,6 +79,10 @@ impl TextEncoder {
     })
   }
 
+  /// Encode a single string and return its 768-dim L2-normalized
+  /// [`Embedding`]. Empty input is rejected with [`Error::EmptyText`].
+  /// For multiple inputs, prefer [`Self::embed_batch`] — it amortizes
+  /// the per-call ORT overhead across the batch.
   pub fn embed(&mut self, text: &str) -> Result<Embedding> {
     if text.is_empty() {
       return Err(Error::EmptyText);
@@ -129,6 +140,10 @@ impl TextEncoder {
     Ok(out)
   }
 
+  /// Run a single throwaway inference to amortize first-call ORT
+  /// graph compilation. Useful when latency-sensitive code wants to
+  /// pay the warm-up cost up-front rather than on the first user
+  /// request.
   pub fn warmup(&mut self) -> Result<()> {
     let _ = self.embed("warmup")?;
     Ok(())
