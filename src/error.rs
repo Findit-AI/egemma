@@ -18,7 +18,11 @@ pub enum Error {
   #[error("required ONNX output `{name}` was missing from session run")]
   MissingOnnxOutput { name: &'static str },
 
-  #[error("tokenizer load failed: {0}")]
+  /// Tokenizer load OR runtime use failure. Covers `Tokenizer::from_file`
+  /// errors at construction, `<pad>`-token contract violations during
+  /// configuration, `encode_batch` failures during inference, and any
+  /// uneven-row anomalies surfaced from the tokenizers crate.
+  #[error("tokenizer error: {0}")]
   Tokenizer(String),
 
   #[error("unexpected output rank: expected 2, got {rank} with shape {shape:?}")]
@@ -29,6 +33,19 @@ pub enum Error {
     input: &'static str,
     expected: &'static str,
     got: Vec<i64>,
+  },
+
+  /// Session contract violation that isn't a shape mismatch — wrong
+  /// element type, missing outlet, or non-tensor outlet. Carries the
+  /// actual `TensorElementType` so users debugging a bad re-export
+  /// see the dtype, not a shape vector that doesn't apply. Gated on
+  /// `feature = "inference"` because the `got` field is an `ort` type.
+  #[cfg(feature = "inference")]
+  #[error("session contract mismatch on `{input}`: expected {expected}, got {got:?}")]
+  SessionContractMismatch {
+    input: &'static str,
+    expected: &'static str,
+    got: ort::value::TensorElementType,
   },
 
   #[error("embedding dimension mismatch: expected {expected}, got {got}")]
@@ -50,6 +67,14 @@ pub enum Error {
     batch_size: usize,
     max_batch_size: usize,
   },
+
+  /// `BatchOptions::max_seq_len` was zero at encoder construction.
+  /// Tokenizer truncation requires `max_length > 0`; a zero-length
+  /// budget is meaningless. Caught alongside `InvalidBatchSize` so
+  /// shape-of-options errors stay together rather than leaking out
+  /// as opaque tokenizer-config errors.
+  #[error("invalid max_seq_len 0: must be > 0")]
+  InvalidMaxSeqLen,
 
   #[error("batch index {index}: {source}")]
   Batch { index: usize, source: Box<Error> },

@@ -43,23 +43,28 @@ impl TextEncoder {
   pub fn from_files_with_options(graph: &Path, tokenizer: &Path, opts: Options) -> Result<Self> {
     let session = crate::session::build_session(graph, opts)?;
     let tokenizer = Tokenizer::from_file(tokenizer).map_err(|e| Error::Tokenizer(e.to_string()))?;
-    let tokenizer = configure_tokenizer(tokenizer, opts.batch().max_seq_len())?;
+    // `configure_tokenizer` runs inside `from_ort_session_with_options`,
+    // so we don't apply it here.
     Self::from_ort_session_with_options(session, tokenizer, opts)
   }
 
   pub fn from_ort_session(session: ort::session::Session, tokenizer: Tokenizer) -> Result<Self> {
-    let opts = Options::default();
-    let tokenizer = configure_tokenizer(tokenizer, opts.batch().max_seq_len())?;
-    Self::from_ort_session_with_options(session, tokenizer, opts)
+    Self::from_ort_session_with_options(session, tokenizer, Options::default())
   }
 
-  fn from_ort_session_with_options(
+  /// Construct from a caller-built `ort::Session` and `Tokenizer` with
+  /// custom [`Options`]. Public so wasm32 callers (who can't use
+  /// [`Self::from_files_with_options`] because `ort 2.0.0-rc.12`
+  /// cfg-gates `commit_from_file` out of wasm builds) can still tune
+  /// `max_seq_len`, `batch_size`, and `max_batch_size`.
+  pub fn from_ort_session_with_options(
     session: ort::session::Session,
     tokenizer: Tokenizer,
     opts: Options,
   ) -> Result<Self> {
     validate_text_session(&session)?;
     opts.batch().validate()?;
+    let tokenizer = configure_tokenizer(tokenizer, opts.batch().max_seq_len())?;
     Ok(Self {
       session,
       tokenizer,
@@ -81,9 +86,22 @@ impl TextEncoder {
   /// and runs one ORT inference per chunk; the returned `Vec` preserves
   /// input order and has the same length as `texts` on success.
   ///
-  /// **Failure semantics.** Aborts on the first failing input and returns
-  /// `Error::Batch { index, source }` carrying the offending zero-based
-  /// index. Already-computed embeddings from earlier chunks are dropped.
+  /// **Failure semantics.** Aborts on the first failing chunk and returns
+  /// `Error::Batch { index, source }`. The wrapped `index` granularity
+  /// depends on where the failure originated:
+  ///
+  /// - **Row-precise** (`index = base + offending_row`) for failures
+  ///   that pin to a specific input: empty-text guard, per-row
+  ///   tokenizer-output length mismatch, and per-row embedding
+  ///   normalization failures (`Error::NotNormalized` from
+  ///   `from_model_output`).
+  /// - **Chunk-level** (`index = base`, the chunk's first input
+  ///   position) for failures that don't pin to a single row:
+  ///   `tokenizer.encode_batch` failures, ORT tensor-build / `run` /
+  ///   output-extract errors, output-rank or output-shape mismatches.
+  ///   Inspect `source` to disambiguate.
+  ///
+  /// Already-computed embeddings from earlier chunks are dropped.
   pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Embedding>> {
     if texts.is_empty() {
       return Ok(Vec::new());
@@ -307,10 +325,13 @@ fn check_outlet(
   match outlet.dtype() {
     ValueType::Tensor { ty, shape, .. } => {
       if *ty != expected_dtype {
-        return Err(Error::SessionShapeMismatch {
+        // Use `SessionContractMismatch` so the actual dtype shows up
+        // in the message — `SessionShapeMismatch.got: Vec<i64>` would
+        // either be the shape (irrelevant for a dtype error) or empty.
+        return Err(Error::SessionContractMismatch {
           input: name,
           expected: "matching tensor dtype",
-          got: shape.to_vec(),
+          got: *ty,
         });
       }
       let actual: &[i64] = shape;

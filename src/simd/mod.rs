@@ -1,6 +1,6 @@
 //! Crate-internal SIMD primitives. Only one operation is hot enough to
 //! be worth hand-vectorizing: the 768-element f32 dot product
-//! ([`Embedding::cosine`], `||v||²` during normalization). Pointwise
+//! ([`Embedding::try_cosine`], `||v||²` during normalization). Pointwise
 //! scales and integer widenings auto-vectorize under `-O3`, so they
 //! stay in scalar form.
 //!
@@ -27,7 +27,7 @@
 //! scalar under `cfg!(miri)`. Miri cannot evaluate target-specific
 //! LLVM intrinsics (`vfmaq_f32`, `_mm256_fmadd_ps`, …) and would
 //! abort with "unsupported operation: can't call foreign function"
-//! the moment a normal test went through `Embedding::cosine`.
+//! the moment a normal test went through `Embedding::try_cosine`.
 //! Routing through scalar lets the Miri matrix exercise the same
 //! call sites as native CI — and validate the *unsafe-free* path —
 //! without ever entering the SIMD backends. The per-arch backend
@@ -56,7 +56,7 @@ fn dot_768_dispatch(a: &[f32; 768], b: &[f32; 768]) -> f32 {
   // Miri can't evaluate `vfmaq_f32` / `vld1q_f32` and would abort with
   // "unsupported operation: can't call foreign function" — see the
   // module-level docstring. Route through scalar so Miri-driven jobs
-  // still exercise `Embedding::cosine` and the surrounding logic.
+  // still exercise `Embedding::try_cosine` and the surrounding logic.
   if cfg!(miri) {
     return scalar::dot_768(a, b);
   }

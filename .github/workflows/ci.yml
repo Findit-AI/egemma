@@ -170,10 +170,14 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     # Linux / macOS: full feature-powerset minus the EP features (see
-    # the clippy job for that exclusion).
+    # the clippy job for that exclusion). `--exclude-no-default-features`
+    # is intentionally NOT set so the powerset also runs the
+    # `--no-default-features` and `--no-default-features --features serde`
+    # combos — those exercise the cfg-gated `serde` derive paths in
+    # `src/options.rs` that the default-features build can't reach.
     - name: Run test (Linux/macOS)
       if: runner.os != 'Windows'
-      run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features cuda,tensorrt,directml,rocm,coreml
+      run: cargo hack test --feature-powerset --exclude-features cuda,tensorrt,directml,rocm,coreml
     # Windows: also exclude `inference` and `default`. ORT's prebuilt
     # binary on `x86_64-pc-windows-msvc` is linked against the dynamic
     # CRT (`/MD`), but the C/C++ build scripts in `tokenizers` deps
@@ -191,7 +195,7 @@ jobs:
     # macOS runners.
     - name: Run test (Windows — skip inference due to MSVC CRT conflict)
       if: runner.os == 'Windows'
-      run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features cuda,tensorrt,directml,rocm,coreml,inference,default
+      run: cargo hack test --feature-powerset --exclude-features cuda,tensorrt,directml,rocm,coreml,inference,default
 
   sanitizer:
     name: sanitizer

@@ -181,9 +181,13 @@ impl BatchOptions {
     self
   }
 
-  /// Reject `batch_size == 0` (the silent `.max(1)` coercion footgun) and
-  /// `batch_size > max_batch_size` (a config error that wastes scratch
-  /// memory and never produces a chunk that large in practice).
+  /// Reject:
+  /// - `batch_size == 0` (the silent `.max(1)` coercion footgun)
+  /// - `batch_size > max_batch_size` (config error: wastes scratch
+  ///   memory and never produces a chunk that large in practice)
+  /// - `max_seq_len == 0` (tokenizer truncation requires `max_length > 0`;
+  ///   a zero-length budget is meaningless and would otherwise leak out
+  ///   as an opaque tokenizer-config error from `configure_tokenizer`)
   #[cfg_attr(not(any(feature = "inference", test)), allow(dead_code))]
   pub(crate) fn validate(&self) -> Result<(), crate::Error> {
     if self.batch_size == 0 || self.batch_size > self.max_batch_size {
@@ -191,6 +195,9 @@ impl BatchOptions {
         batch_size: self.batch_size,
         max_batch_size: self.max_batch_size,
       });
+    }
+    if self.max_seq_len == 0 {
+      return Err(crate::Error::InvalidMaxSeqLen);
     }
     Ok(())
   }
