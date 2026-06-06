@@ -40,6 +40,26 @@ serde      = { version = "1", features = ["derive"], optional = true }
 [dev-dependencies]
 serde_json = "1"
 
+# ── MLX (mlxrs) inference backend — Apple Silicon only ──────────────────
+#
+# `mlxrs` binds the Metal-backed MLX C++ runtime through `mlx-c` FFI and
+# only builds on `aarch64-apple-darwin`, so it is declared under a target
+# table — it never enters the dependency graph on any other host. It is
+# **non-optional** there (no Cargo feature gates it): the crate picks the best
+# backend per platform automatically, with no user-facing knob. On macOS/arm64
+# the public `TextEncoder::from_dir` constructor auto-routes to the MLX backend
+# when an MLX checkpoint is present and falls back to ONNX otherwise; on every
+# other platform only the ONNX path is compiled. The `embeddinggemma` feature
+# gives the Gemma3 bidirectional backbone + mean pooling + Dense projection head.
+#
+# Build-cost note: because this is non-optional on macOS/arm64, EVERY
+# macOS/arm64 build that enables `inference` compiles `mlxrs`, which builds the
+# MLX C++/Metal runtime from source on a cold target directory. This is the
+# deliberate cost of the "no opt-out, best-backend-by-platform" directive;
+# non-Apple-Silicon hosts never pay it.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+mlxrs = { path = "../mlxrs/mlxrs", default-features = false, features = ["embeddinggemma"] }
+
 # =====================================================================
 # Target / feature contract.
 #
@@ -63,6 +83,19 @@ serde_json = "1"
 # =====================================================================
 [features]
 default   = ["inference"]
+# Widen which weight FORMATS the auto-selected MLX (`mlxrs`) backend accepts on
+# Apple Silicon. Off by default, the MLX path reads only `model.safetensors`
+# (and the crate builds everywhere exactly as before). With `npz`/`gguf` on, the
+# loader's format detector additionally probes a `*.npz`/`*.gguf`, and the
+# backend probe routes such a dir to MLX. Each enables the matching `mlxrs`
+# feature; `mlxrs` is a macOS-arm64-only target dependency, so on every other
+# target the `mlxrs/<fmt>` activation is a harmless no-op (the npz/gguf detection
+# code is itself `#[cfg(feature = ...)]`-gated, so it isn't compiled). These are
+# NOT a backend knob — MLX stays auto-selected by platform; they only widen the
+# accepted weight formats. (gguf is a weight load seam: its embedded metadata is
+# not mapped to a config — a `config.json` is still required alongside it.)
+npz       = ["mlxrs/npz"]
+gguf      = ["mlxrs/gguf"]
 # Activates the ONNX-backed inference path (`TextEncoder`). Native
 # targets only — see the target / feature contract block above for the
 # wasm escape hatch.
@@ -73,6 +106,13 @@ inference = ["dep:ort", "dep:tokenizers"]
 # slice (see `Embedding` docs) so the dim and L2-norm invariants that
 # `TryFrom<Vec<f32>>` exists to enforce can't be bypassed.
 serde     = ["dep:serde"]
+# NOTE: there is intentionally no `mlx` feature. The MLX (`mlxrs`) Metal
+# backend is selected automatically by platform — see the `mlxrs` target
+# dependency above and the `from_dir` auto-routing in `src/text_enc.rs`. On
+# macOS/arm64 it compiles unconditionally (whenever `inference` is on) and the
+# public `TextEncoder::from_dir` routes to it when an MLX checkpoint is present;
+# elsewhere only the ONNX path exists. Removing the user-facing knob is
+# deliberate (best-backend-by-platform, no opt-out).
 
 # ----- Opt-in execution providers --------------------------------------
 #

@@ -156,6 +156,56 @@ pub enum Error {
   /// file).
   #[error(transparent)]
   Io(#[from] std::io::Error),
+
+  /// Error from the MLX (`mlxrs`) inference backend — checkpoint load,
+  /// tokenization, or the bidirectional backbone / Dense-head forward pass.
+  /// Compiled only on the Apple-Silicon target (the only place the backend
+  /// exists). The `mlxrs::Error` is captured as its `Display` string so this
+  /// crate's public `Error` does not leak the `mlxrs` type into its API.
+  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[error("mlx backend error: {0}")]
+  Mlx(
+    /// Human-readable description of the MLX backend failure.
+    String,
+  ),
+
+  /// `Vec::try_reserve_exact` returned an error — the global allocator could
+  /// not satisfy a text-batch scratch request on the MLX path. Surfaced as a
+  /// typed error rather than a process abort. `requested_bytes` helps callers
+  /// tell whether they hit a cap they chose versus system memory pressure.
+  ///
+  /// `cause` is named (not `source`) because `TryReserveError` does not
+  /// implement `std::error::Error` on stable Rust today, so its `Display` is
+  /// captured as a string. Compiled only on the Apple-Silicon target (the only
+  /// place the MLX backend exists).
+  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[error("failed to allocate {requested_bytes} bytes for `{which}` scratch buffer: {cause}")]
+  AllocationFailed {
+    /// Buffer the allocator was asked to reserve.
+    which: &'static str,
+    /// Number of bytes that were requested.
+    requested_bytes: usize,
+    /// `Display` representation of the underlying `TryReserveError`.
+    cause: String,
+  },
+}
+
+#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+impl Error {
+  /// Build an [`Error::Mlx`] from a static reason string.
+  pub(crate) fn mlx(reason: &'static str) -> Self {
+    Error::Mlx(reason.to_string())
+  }
+
+  /// Build an [`Error::Mlx`] from an owned reason string.
+  pub(crate) fn mlx_owned(reason: String) -> Self {
+    Error::Mlx(reason)
+  }
+
+  /// Convert an `mlxrs::Error` into [`Error::Mlx`], capturing its `Display`.
+  pub(crate) fn from_mlx(source: mlxrs::Error) -> Self {
+    Error::Mlx(source.to_string())
+  }
 }
 
 /// Crate-local `Result` alias parameterized on the [`Error`](enum@Error)

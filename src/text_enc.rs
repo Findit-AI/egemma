@@ -16,13 +16,56 @@ use crate::{
 const EMBED_DIM: usize = Embedding::EMBED_DIM;
 const PAD_TOKEN: &str = "<pad>";
 
-/// `embedding-gemma` text-tower inference. Owns one `ort::Session` and one
-/// `tokenizers::Tokenizer`.
+/// `embedding-gemma` text-tower inference.
 ///
-/// `TextEncoder: Send + !Sync` — `ort::Session` is `!Sync`. Workers wanting
-/// parallelism instantiate one `TextEncoder` per thread, or share one behind
-/// a `Mutex<TextEncoder>`.
+/// Holds either an ONNX Runtime session + tokenizer (the `ort` backend) or — on
+/// Apple Silicon, when [`Self::from_dir`] auto-routes to it — an `mlxrs` MLX
+/// model + tokenizer (the MLX backend), behind one public API. Both return the
+/// same 768-dim L2-normalized [`Embedding`].
+///
+/// Auto-trait reality is platform-conditional:
+/// - On every target **except** `aarch64-apple-darwin`: `Send + !Sync`. Only the
+///   `ort` backend is compiled; `ort::Session` is `Send` but `!Sync`.
+/// - On `aarch64-apple-darwin`: `!Send + !Sync`. The MLX backend variant is
+///   compiled in unconditionally (whenever `inference` is on), and it holds an
+///   `Rc`-backed MLX model whose device handles are not `Send` — so the enum is
+///   `!Send` for *every* `TextEncoder` on this target, including `ort`-backed
+///   ones (an enum is `Send` only if all its variants are).
+///
+/// Either way the type is `!Sync`. Workers wanting parallelism instantiate one
+/// `TextEncoder` per thread; off Apple Silicon they may alternatively share one
+/// behind a `Mutex<TextEncoder>`.
 pub struct TextEncoder {
+  backend: TextBackend,
+}
+
+/// The inference backend behind a [`TextEncoder`].
+enum TextBackend {
+  Ort(OrtTextEncoder),
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  Mlx {
+    model: crate::mlx::MlxModel,
+    tokenizer: Tokenizer,
+  },
+}
+
+impl TextBackend {
+  /// The hard cap on a single batch's length for this backend. Used by
+  /// [`TextEncoder::embed_batch`] to reject an oversized batch (with
+  /// [`Error::BatchTooLarge`]) before the per-item empty scan and before
+  /// dispatch — the ONNX path reads it off [`Options::batch`]'s
+  /// `max_batch_size`; the MLX path off the model's adopted crate-default cap.
+  fn max_batch_size(&self) -> usize {
+    match self {
+      TextBackend::Ort(ort) => ort.opts.batch().max_batch_size(),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      TextBackend::Mlx { model, .. } => model.max_batch_size(),
+    }
+  }
+}
+
+/// The ONNX Runtime text encoder. Owns one `ort::Session` and one tokenizer.
+struct OrtTextEncoder {
   session: ort::session::Session,
   tokenizer: Tokenizer,
   opts: Options,
@@ -73,9 +116,64 @@ impl TextEncoder {
     opts.batch().validate()?;
     let tokenizer = configure_tokenizer(tokenizer, opts.batch().max_seq_len())?;
     Ok(Self {
-      session,
-      tokenizer,
-      opts,
+      backend: TextBackend::Ort(OrtTextEncoder {
+        session,
+        tokenizer,
+        opts,
+      }),
+    })
+  }
+
+  /// Load the text tower from a **checkpoint directory**, automatically picking
+  /// the best backend for the platform — there is no backend knob.
+  ///
+  /// On Apple Silicon (`aarch64-apple-darwin`) the directory is probed and
+  /// routes to the `mlxrs` **MLX** Metal backend when the text ONNX graph this
+  /// constructor needs (`model.onnx`) is absent and an MLX checkpoint
+  /// (`config.json` + `model.safetensors`) is present; otherwise the **ONNX**
+  /// graph + the directory's `tokenizer.json` are loaded via ONNX Runtime. On
+  /// every other platform only the ONNX backend is compiled, so that path is
+  /// taken unconditionally.
+  ///
+  /// **Not available on wasm32** (the ONNX session constructors are gated out —
+  /// see [`Self::from_files`]).
+  #[cfg(not(target_arch = "wasm32"))]
+  pub fn from_dir(dir: &Path) -> Result<Self> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::backend_select::prefer_mlx(dir, &[crate::backend_select::TEXT_ONNX]) {
+      return Self::from_mlx_dir(dir);
+    }
+    Self::from_onnx_dir(dir)
+  }
+
+  /// ONNX dispatch target for [`Self::from_dir`]: load the text ONNX graph
+  /// (`crate::backend_select`'s `TEXT_ONNX`) + the directory's `tokenizer.json`.
+  /// Crate-internal — the user's directory entry point is [`Self::from_dir`].
+  #[cfg(not(target_arch = "wasm32"))]
+  pub(crate) fn from_onnx_dir(dir: &Path) -> Result<Self> {
+    Self::from_files(
+      &dir.join(crate::backend_select::TEXT_ONNX),
+      &dir.join("tokenizer.json"),
+    )
+  }
+
+  /// MLX dispatch target for [`Self::from_dir`]: load from an **MLX checkpoint
+  /// directory** (`config.json` + `model.safetensors` + `tokenizer.json`, and
+  /// optionally `1_Pooling/config.json`) using the `mlxrs` Metal backend.
+  ///
+  /// Crate-internal — the user's directory entry point is [`Self::from_dir`],
+  /// which auto-routes here on Apple Silicon when an MLX checkpoint is present.
+  /// The tokenizer is loaded from `tokenizer.json` in the same directory via
+  /// `prepare_mlx_tokenizer`: its serialized padding/truncation are **disabled**
+  /// (so `encode` returns each row's real ids plus the post-processor's BOS),
+  /// and the dynamic-right-pad to the batch maximum is built manually under
+  /// `mlxrs`'s EmbeddingGemma contract.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub(crate) fn from_mlx_dir(dir: &Path) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_dir(dir)?;
+    let tokenizer = prepare_mlx_tokenizer(&dir.join("tokenizer.json"))?;
+    Ok(Self {
+      backend: TextBackend::Mlx { model, tokenizer },
     })
   }
 
@@ -117,7 +215,13 @@ impl TextEncoder {
     if texts.is_empty() {
       return Ok(Vec::new());
     }
-    let max = self.opts.batch().max_batch_size();
+    // Reject an oversized batch BEFORE the per-item empty scan and BEFORE
+    // dispatching to the backend, so an oversized batch that *also* contains an
+    // empty string returns `Error::BatchTooLarge` (the batch-shape problem), not
+    // `Error::Batch { source: EmptyText }` — the default ONNX path's historical
+    // ordering: (1) empty slice; (2) max-batch cap; (3) per-item empty scan;
+    // (4) dispatch.
+    let max = self.backend.max_batch_size();
     if texts.len() > max {
       return Err(Error::BatchTooLarge {
         got: texts.len(),
@@ -130,14 +234,11 @@ impl TextEncoder {
         source: Box::new(Error::EmptyText),
       });
     }
-    let chunk = self.opts.batch().batch_size();
-    let mut out = Vec::with_capacity(texts.len());
-    for (chunk_idx, group) in texts.chunks(chunk).enumerate() {
-      let base_index = chunk_idx * chunk;
-      let chunk_emb = embed_chunk(&mut self.session, &self.tokenizer, group, base_index)?;
-      out.extend(chunk_emb);
+    match &mut self.backend {
+      TextBackend::Ort(ort) => ort.embed_batch(texts),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      TextBackend::Mlx { model, tokenizer } => model.embed_text_batch(tokenizer, texts),
     }
-    Ok(out)
   }
 
   /// Run a single throwaway inference to amortize first-call ORT
@@ -147,6 +248,23 @@ impl TextEncoder {
   pub fn warmup(&mut self) -> Result<()> {
     let _ = self.embed("warmup")?;
     Ok(())
+  }
+}
+
+impl OrtTextEncoder {
+  /// Chunk `texts` into groups of `BatchOptions::batch_size` and run one ORT
+  /// inference per chunk. The outer [`TextEncoder::embed_batch`] has already
+  /// rejected an oversized batch and the per-item empty case, so this is the
+  /// pure chunking loop.
+  fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Embedding>> {
+    let chunk = self.opts.batch().batch_size();
+    let mut out = Vec::with_capacity(texts.len());
+    for (chunk_idx, group) in texts.chunks(chunk).enumerate() {
+      let base_index = chunk_idx * chunk;
+      let chunk_emb = embed_chunk(&mut self.session, &self.tokenizer, group, base_index)?;
+      out.extend(chunk_emb);
+    }
+    Ok(out)
   }
 }
 
@@ -427,6 +545,35 @@ fn configure_tokenizer(mut tokenizer: Tokenizer, max_seq_len: usize) -> Result<T
       stride: 0,
     }))
     .map_err(|e| Error::Tokenizer(e.to_string()))?;
+  Ok(tokenizer)
+}
+
+/// Load and prepare the tokenizer for the **MLX** text path from `tokenizer.json`.
+///
+/// The MLX path builds the `(batch, seq)` `input_ids` + `attention_mask`
+/// tensors itself under EmbeddingGemma's dynamic-right-pad contract
+/// (right-pad each row to the batch maximum real length with the Gemma `<pad>`
+/// id, mask `0` over pad cells), so the tokenizer's own built-in **padding** is
+/// disabled here — left enabled it would right-pad each row to a fixed/longest
+/// length with extra special handling the wrapper does not expect. The
+/// **truncation** is likewise disabled: EmbeddingGemma's `mlxrs` contract is
+/// `Padding::DynamicRightPad` with no per-text truncation cap — the library
+/// faithfully tokenizes whatever it is handed and the consuming application
+/// bounds an oversized / untrusted prompt (the library contract; no DoS guard
+/// here). `encode` then returns each row's real ids plus the post-processor's
+/// special tokens (BOS).
+///
+/// `with_truncation(None)` is infallible here (it only errors on
+/// `stride > max_length`, irrelevant when clearing); `with_padding(None)` is
+/// infallible.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn prepare_mlx_tokenizer(tokenizer_json: &Path) -> Result<Tokenizer> {
+  let mut tokenizer =
+    Tokenizer::from_file(tokenizer_json).map_err(|e| Error::Tokenizer(e.to_string()))?;
+  tokenizer
+    .with_truncation(None)
+    .map_err(|e| Error::Tokenizer(e.to_string()))?;
+  tokenizer.with_padding(None);
   Ok(tokenizer)
 }
 
