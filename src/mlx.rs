@@ -20,15 +20,20 @@
 //! The MLX backend consumes an **MLX-format checkpoint** (a `config.json` + a
 //! weight file + a `tokenizer.json`), not the ONNX graph. The canonical
 //! checkpoint is `google/embeddinggemma-300m` re-exported to MLX weights (e.g.
-//! an `mlx-community` mirror). The loader reads `config.json`, then probes the
-//! directory for a weight file in priority order — `model.safetensors`
-//! (always), then (when the `npz` feature is on) a `*.npz`, then (when the
-//! `gguf` feature is on) a `*.gguf` — loads it via the matching `mlxrs` loader,
-//! runs the model's `sanitize` key-remap, and builds the Gemma3
-//! sentence-encoder via `mlxrs`. A quantized export (packed `.weight` /
-//! `.scales` / `.biases` triples + a `quantization` config block) loads through
-//! the same path: `mlxrs`'s `EmbeddingGemmaModel::from_weights` auto-detects
-//! each layer's quantization by the presence of its `.scales` sibling.
+//! an `mlx-community` mirror). The loader reads `config.json`, then delegates
+//! weight discovery to [`mlxrs::io::load_weights_from_dir`], which auto-detects
+//! a sharded `model.safetensors.index.json`, a single `model.safetensors`, a
+//! `*.gguf`, or a `*.npz` — runs the model's `sanitize` key-remap, and builds
+//! the Gemma3 sentence-encoder via `mlxrs`. A quantized export (packed
+//! `.weight` / `.scales` / `.biases` triples + a `quantization` config block)
+//! loads through the same path: `mlxrs`'s `EmbeddingGemmaModel::from_weights`
+//! auto-detects each layer's quantization by the presence of its `.scales`
+//! sibling.
+//!
+//! The explicit-format constructors ([`MlxModel::from_safetensors`], and — under
+//! the matching feature — `from_npz` / `from_gguf`) take a **weight file path**
+//! directly and read the sibling `config.json` (+ optional `1_Pooling`) from the
+//! file's parent directory, for callers who already know the format and location.
 //!
 //! The model dimensions + quantization scheme are always read from
 //! `config.json`; the gguf path is a **weight load seam only** — its embedded
@@ -60,9 +65,6 @@ use crate::{
   error::{Error, Result},
 };
 
-/// The standard safetensors weight-file name inside an MLX checkpoint directory
-/// — the always-available baseline format the detector probes first.
-const SAFETENSORS_FILE: &str = "model.safetensors";
 /// The standard config file name inside an MLX checkpoint directory.
 const CONFIG_FILE: &str = "config.json";
 
@@ -88,86 +90,16 @@ fn weights_are_quantized(weights: &HashMap<String, mlxrs::Array>) -> bool {
   weights.keys().any(|k| k.ends_with(QUANT_SCALES_SUFFIX))
 }
 
-/// Probe `dir` for an MLX weight file in priority order and load it via the
-/// matching `mlxrs` loader, returning the raw (pre-`sanitize`) weight map.
-///
-/// Priority:
-/// 1. `model.safetensors` → [`mlxrs::io::load_safetensors`] (always available).
-/// 2. *(feature `npz`)* a `*.npz` (`model.npz` / `weights.npz`, else the single
-///    `.npz` in the dir) → [`mlxrs::io::load_npz`].
-/// 3. *(feature `gguf`)* a `*.gguf` (`model.gguf`, else the single `.gguf`) →
-///    [`mlxrs::io::load_gguf`] (its `.0` weight map; the gguf metadata is NOT
-///    mapped to a config — `config.json` is still read separately).
-///
-/// Returns [`Error::Mlx`] (no MLX checkpoint) when no weight file in any enabled
-/// format is present. The npz/gguf branches are compiled only when the
-/// corresponding crate feature is enabled, so a default (safetensors-only) build
-/// neither compiles nor depends on them.
-fn load_weights(dir: &Path) -> Result<HashMap<String, mlxrs::Array>> {
-  let safetensors = dir.join(SAFETENSORS_FILE);
-  if safetensors.is_file() {
-    return mlxrs::io::load_safetensors(&safetensors).map_err(Error::from_mlx);
-  }
-
-  #[cfg(feature = "npz")]
-  if let Some(npz) = find_weight_file(dir, "npz", &["model.npz", "weights.npz"]) {
-    return mlxrs::io::load_npz(&npz).map_err(Error::from_mlx);
-  }
-
-  #[cfg(feature = "gguf")]
-  if let Some(gguf) = find_weight_file(dir, "gguf", &["model.gguf"]) {
-    return mlxrs::io::load_gguf(&gguf)
-      .map(|(w, _meta)| w)
-      .map_err(Error::from_mlx);
-  }
-
-  Err(Error::mlx_owned(format!(
-    "no MLX checkpoint weight file in {}: expected {SAFETENSORS_FILE}{}",
-    dir.display(),
-    enabled_format_hint(),
-  )))
-}
-
-/// Suffix listing the additional weight formats the build accepts, for the
-/// "no MLX checkpoint" error. Empty on a default (safetensors-only) build.
-fn enabled_format_hint() -> &'static str {
-  match (cfg!(feature = "npz"), cfg!(feature = "gguf")) {
-    (true, true) => " (or a *.npz / *.gguf)",
-    (true, false) => " (or a *.npz)",
-    (false, true) => " (or a *.gguf)",
-    (false, false) => "",
-  }
-}
-
-/// Find a single weight file of the given `extension` in `dir`: prefer one of
-/// the `preferred` canonical names (in order), else the **sole** file with that
-/// extension. Returns `None` if none is present or the choice is ambiguous (more
-/// than one candidate and no preferred name matched), so a malformed multi-shard
-/// layout falls through to the typed "no checkpoint" error rather than picking
-/// an arbitrary file.
-///
-/// Only referenced from the `npz` / `gguf` detection branches, so it is dead
-/// (and `cfg`-elided) on a default build.
-#[cfg(any(feature = "npz", feature = "gguf"))]
-fn find_weight_file(dir: &Path, extension: &str, preferred: &[&str]) -> Option<std::path::PathBuf> {
-  for name in preferred {
-    let candidate = dir.join(name);
-    if candidate.is_file() {
-      return Some(candidate);
-    }
-  }
-  let mut sole: Option<std::path::PathBuf> = None;
-  for entry in std::fs::read_dir(dir).ok()?.flatten() {
-    let path = entry.path();
-    if path.extension().and_then(|e| e.to_str()) == Some(extension) && path.is_file() {
-      if sole.is_some() {
-        // More than one `.<ext>` file and no preferred name matched: ambiguous.
-        return None;
-      }
-      sole = Some(path);
-    }
-  }
-  sole
+/// The directory the sibling `config.json` (+ optional `1_Pooling`) is read from
+/// when an explicit-format constructor is handed a **weight file path**: the
+/// file's parent directory, or the current directory (`.`) when `weights` is a
+/// bare filename with no parent component (so `from_safetensors("model.safetensors")`
+/// reads `./config.json`, not a config at the filesystem root).
+pub(crate) fn weights_parent(weights: &Path) -> &Path {
+  weights
+    .parent()
+    .filter(|p| !p.as_os_str().is_empty())
+    .unwrap_or_else(|| Path::new("."))
 }
 
 /// A loaded MLX EmbeddingGemma sentence-encoder. Shared (`Rc`) so it can be
@@ -203,30 +135,82 @@ pub(crate) struct MlxModel {
 }
 
 impl MlxModel {
-  /// Load a model from an MLX checkpoint directory containing `config.json` and
-  /// a weight file in any enabled format (`model.safetensors`, or — with the
-  /// `npz`/`gguf` features — a `*.npz`/`*.gguf`; see [`load_weights`]), and,
-  /// optionally, a `1_Pooling/config.json` carrying the matryoshka output
-  /// dimension + mean strategy.
+  /// Load a model from an MLX checkpoint **directory** containing `config.json`,
+  /// a weight set, and optionally a `1_Pooling/config.json` (the matryoshka
+  /// output dimension + mean strategy).
+  ///
+  /// Weight discovery is delegated to [`mlxrs::io::load_weights_from_dir`], which
+  /// auto-detects a sharded `model.safetensors.index.json`, a single
+  /// `model.safetensors`, a `*.gguf`, or a `*.npz` via the centralized `mlxrs`
+  /// loader. For an exact known weight file path use [`Self::from_safetensors`]
+  /// (or the feature-gated `from_npz` / `from_gguf`).
   pub(crate) fn from_dir(dir: &Path) -> Result<Self> {
+    Self::construct(dir, || {
+      mlxrs::io::load_weights_from_dir(dir).map_err(Error::from_mlx)
+    })
+  }
+
+  /// Load a model from an **exact** `model.safetensors` file path. The
+  /// `config.json` (and optional `1_Pooling/config.json`) are read from the
+  /// weight file's parent directory (see [`weights_parent`]).
+  pub(crate) fn from_safetensors(weights: &Path) -> Result<Self> {
+    Self::construct(weights_parent(weights), || {
+      mlxrs::io::load_safetensors(weights).map_err(Error::from_mlx)
+    })
+  }
+
+  /// Load a model from an **exact** `*.npz` file path. The `config.json` (and
+  /// optional `1_Pooling/config.json`) are read from the weight file's parent
+  /// directory (see [`weights_parent`]).
+  #[cfg(feature = "npz")]
+  pub(crate) fn from_npz(weights: &Path) -> Result<Self> {
+    Self::construct(weights_parent(weights), || {
+      mlxrs::io::load_npz(weights).map_err(Error::from_mlx)
+    })
+  }
+
+  /// Load a model from an **exact** `*.gguf` file path. The `config.json` (and
+  /// optional `1_Pooling/config.json`) are read from the weight file's parent
+  /// directory (see [`weights_parent`]); the gguf's embedded metadata is NOT
+  /// mapped to a config, so a sibling `config.json` is still required.
+  #[cfg(feature = "gguf")]
+  pub(crate) fn from_gguf(weights: &Path) -> Result<Self> {
+    Self::construct(weights_parent(weights), || {
+      mlxrs::io::load_gguf(weights)
+        .map(|(w, _meta)| w)
+        .map_err(Error::from_mlx)
+    })
+  }
+
+  /// Shared construction body for every MLX constructor: read + validate the
+  /// `config.json` from `dir`, then load the weights via `load`, `sanitize`,
+  /// read the optional pooling config, and build the Gemma3 sentence-encoder.
+  ///
+  /// `dir` is the directory the `config.json` + `1_Pooling/config.json` live in
+  /// (the checkpoint dir for [`Self::from_dir`], the weight file's parent for the
+  /// explicit-format constructors); `load` supplies the raw (pre-`sanitize`)
+  /// weight map. The config read + full [`Gemma3Config::validate`] run BEFORE
+  /// `load`, so a malformed config fails fast and never touches the weight file.
+  fn construct(
+    dir: &Path,
+    load: impl FnOnce() -> Result<HashMap<String, mlxrs::Array>>,
+  ) -> Result<Self> {
     let config_path = dir.join(CONFIG_FILE);
 
     let config_json = std::fs::read_to_string(&config_path)?;
     let config = Gemma3Config::from_json(&config_json).map_err(Error::from_mlx)?;
 
-    // `hidden_size` is the pooled-embedding (and Dense-head input/output) width
-    // and the embedding-table column count. A non-positive value would build a
-    // zero-sized tensor / divide-by-zero in the backbone, so reject it at
-    // construction with a typed error BEFORE any weight is loaded. `mlxrs`'s
-    // `from_weights` runs the full `Gemma3Config::validate` (which pins every
-    // other dimension / count > 0) too, so this is the minimal architecture-
-    // geometry positivity guard — NO upper cap is imposed (the checkpoint
-    // author owns the model dimensions; this is a library, not DoS-hardened).
-    if config.hidden_size <= 0 {
-      return Err(Error::mlx("hidden_size must be a positive dimension"));
-    }
+    // Run the FULL `Gemma3Config::validate` (it pins `model_type` and requires
+    // every dimension / count — `hidden_size`, `vocab_size`, the layer / head
+    // counts, the grouped-query split, the finite-positive RoPE / RMSNorm /
+    // scale floats — structurally valid) BEFORE any weight is loaded, so a
+    // malformed config fails fast with a typed error and never touches the
+    // (expensive) weight file. NO upper cap beyond `mlxrs`'s own is imposed (the
+    // checkpoint author owns the model dimensions; this is a library, not
+    // DoS-hardened).
+    config.validate().map_err(Error::from_mlx)?;
 
-    let raw = load_weights(dir)?;
+    let raw = load()?;
     let weights = sanitize(raw).map_err(Error::from_mlx)?;
 
     // An MLX EmbeddingGemma checkpoint may be a QUANTIZED safetensors (an
@@ -615,6 +599,41 @@ mod tests {
     }
   }
 
+  /// A `config.json` that PARSES but fails the full [`Gemma3Config::validate`]
+  /// on a NON-`hidden_size` field — here a wrong `model_type` (validate pins it
+  /// to `"gemma3_text"`) — is rejected with a typed [`Error::Mlx`] BEFORE any
+  /// weight is loaded. The temp dir holds ONLY the malformed `config.json` (no
+  /// readable weight file), so a `from_dir` that nonetheless errors proves the
+  /// full config validation runs ahead of the (expensive) weight load, not after
+  /// it in `from_weights`.
+  #[test]
+  fn from_dir_rejects_invalid_config_before_weight_load() {
+    let dir = std::env::temp_dir().join(format!(
+      "egemma_mlx_cfg_modeltype_{}_{:?}",
+      std::process::id(),
+      std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp config dir");
+    // Valid JSON with a valid positive `hidden_size`, but a `model_type` the
+    // validator rejects — so the failure is on a field OTHER than `hidden_size`,
+    // and no weight file exists in the dir.
+    std::fs::write(
+      dir.join(CONFIG_FILE),
+      br#"{"model_type": "not_gemma3", "hidden_size": 768}"#,
+    )
+    .expect("write config.json");
+    let result = MlxModel::from_dir(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = result
+      .err()
+      .expect("an invalid model_type must be rejected at construction");
+    assert!(
+      matches!(err, Error::Mlx(_)),
+      "expected Error::Mlx for an invalid config, got {err}"
+    );
+  }
+
   /// A quantized / fp16 MLX checkpoint yields an embedding in f16; the strict
   /// `to_vec::<f32>` would fail without the astype cast. Build an f16 `(2, 2)`
   /// array and assert it extracts to the right f32 rows.
@@ -626,118 +645,24 @@ mod tests {
     assert_eq!(rows, vec![vec![1.0_f32, 2.0], vec![3.0, 4.0]]);
   }
 
-  /// Create a fresh temp dir for a format-detection test, named for `tag`.
-  fn detect_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-      "egemma_mlx_detect_{tag}_{}_{:?}",
-      std::process::id(),
-      std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create temp detect dir");
-    dir
-  }
-
-  /// `load_weights` over a dir with no weight file in any enabled format returns
-  /// the typed "no MLX checkpoint" [`Error::Mlx`] (naming `model.safetensors`),
-  /// rather than a panic. Exercised on a bare dir (config-less is fine — the
-  /// detector only probes weight files).
+  /// [`weights_parent`] returns the file's parent directory for a path with a
+  /// directory component, and the current directory (`.`) — never the filesystem
+  /// root — for a bare filename, so an explicit-format constructor handed
+  /// `"model.safetensors"` reads `./config.json`.
   #[test]
-  fn load_weights_no_weight_file_is_typed_error() {
-    let dir = detect_dir("none");
-    // The `Ok` type (`HashMap<_, Array>`) is not `Debug`, so destructure the
-    // `Result` directly rather than via `expect_err`.
-    let result = load_weights(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
-    match result {
-      Err(Error::Mlx(msg)) => assert!(
-        msg.contains("model.safetensors"),
-        "the no-checkpoint error must name model.safetensors, got {msg:?}"
-      ),
-      Err(other) => panic!("expected Error::Mlx for a weight-less dir, got {other}"),
-      Ok(_) => panic!("a dir with no weight file must be rejected"),
-    }
-  }
-
-  /// The npz weight-file detector prefers a canonical `model.npz` and otherwise
-  /// accepts the sole `.npz` in the dir, but reports `None` (ambiguous → falls
-  /// through to the typed no-checkpoint error) when several `.npz` files exist
-  /// and none is a preferred name. Empty marker files suffice — the detector
-  /// only inspects names/extensions, never contents.
-  #[cfg(feature = "npz")]
-  #[test]
-  fn find_weight_file_npz_prefers_canonical_then_sole() {
-    // Sole non-canonical `.npz` → selected.
-    let sole = detect_dir("npz_sole");
-    std::fs::write(sole.join("export.npz"), b"").expect("write export.npz");
-    let picked = find_weight_file(&sole, "npz", &["model.npz", "weights.npz"])
-      .expect("the sole .npz must be selected");
-    assert_eq!(picked, sole.join("export.npz"));
-    let _ = std::fs::remove_dir_all(&sole);
-
-    // Canonical `model.npz` wins even when another `.npz` is present.
-    let canon = detect_dir("npz_canon");
-    std::fs::write(canon.join("export.npz"), b"").expect("write export.npz");
-    std::fs::write(canon.join("model.npz"), b"").expect("write model.npz");
-    let picked = find_weight_file(&canon, "npz", &["model.npz", "weights.npz"])
-      .expect("model.npz must win over a non-canonical sibling");
-    assert_eq!(picked, canon.join("model.npz"));
-    let _ = std::fs::remove_dir_all(&canon);
-
-    // Two non-canonical `.npz` files → ambiguous → None.
-    let ambig = detect_dir("npz_ambig");
-    std::fs::write(ambig.join("a.npz"), b"").expect("write a.npz");
-    std::fs::write(ambig.join("b.npz"), b"").expect("write b.npz");
-    assert!(
-      find_weight_file(&ambig, "npz", &["model.npz", "weights.npz"]).is_none(),
-      "two non-canonical .npz files must be ambiguous (None)"
+  fn weights_parent_resolves_parent_else_current_dir() {
+    assert_eq!(
+      weights_parent(Path::new("/ckpt/model.safetensors")),
+      Path::new("/ckpt")
     );
-    let _ = std::fs::remove_dir_all(&ambig);
-  }
-
-  /// The gguf weight-file detector prefers a canonical `model.gguf` and
-  /// otherwise accepts the sole `.gguf` in the dir.
-  #[cfg(feature = "gguf")]
-  #[test]
-  fn find_weight_file_gguf_prefers_canonical_then_sole() {
-    let sole = detect_dir("gguf_sole");
-    std::fs::write(sole.join("q8.gguf"), b"").expect("write q8.gguf");
-    let picked =
-      find_weight_file(&sole, "gguf", &["model.gguf"]).expect("the sole .gguf must be selected");
-    assert_eq!(picked, sole.join("q8.gguf"));
-    let _ = std::fs::remove_dir_all(&sole);
-
-    let canon = detect_dir("gguf_canon");
-    std::fs::write(canon.join("q8.gguf"), b"").expect("write q8.gguf");
-    std::fs::write(canon.join("model.gguf"), b"").expect("write model.gguf");
-    let picked = find_weight_file(&canon, "gguf", &["model.gguf"])
-      .expect("model.gguf must win over a non-canonical sibling");
-    assert_eq!(picked, canon.join("model.gguf"));
-    let _ = std::fs::remove_dir_all(&canon);
-  }
-
-  /// `model.safetensors` wins over a present `*.npz`/`*.gguf` regardless of which
-  /// features are on: the detector probes safetensors first. With an empty
-  /// safetensors marker present, `load_weights` reaches the real
-  /// `load_safetensors` (which then surfaces an `mlxrs` parse error on the empty
-  /// file — proving safetensors was the selected branch, not npz/gguf).
-  #[test]
-  fn load_weights_prefers_safetensors_first() {
-    let dir = detect_dir("prefer_st");
-    std::fs::write(dir.join(SAFETENSORS_FILE), b"").expect("write empty safetensors");
-    #[cfg(feature = "npz")]
-    std::fs::write(dir.join("model.npz"), b"").expect("write model.npz");
-    #[cfg(feature = "gguf")]
-    std::fs::write(dir.join("model.gguf"), b"").expect("write model.gguf");
-    // The empty safetensors is malformed, so `load_safetensors` errors — but the
-    // error proves the safetensors branch was taken (it reached the real loader).
-    // The `Ok` type is not `Debug`, so destructure the `Result` directly.
-    let result = load_weights(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
-    match result {
-      Err(Error::Mlx(_)) => {}
-      Err(other) => panic!("expected an Error::Mlx from the safetensors loader, got {other}"),
-      Ok(_) => panic!("an empty safetensors must surface a load error, not succeed"),
-    }
+    assert_eq!(
+      weights_parent(Path::new("ckpt/model.npz")),
+      Path::new("ckpt")
+    );
+    // A bare filename has an empty parent; it must map to `.`, not `""`.
+    assert_eq!(
+      weights_parent(Path::new("model.safetensors")),
+      Path::new(".")
+    );
   }
 }

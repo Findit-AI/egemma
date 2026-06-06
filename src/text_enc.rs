@@ -177,6 +177,59 @@ impl TextEncoder {
     })
   }
 
+  /// Load the **MLX** text tower from an exact `model.safetensors` file path
+  /// (Apple Silicon only). The `config.json` (and optional `1_Pooling`) and the
+  /// `tokenizer.json` are read from the weight file's parent directory
+  /// (`weights.parent()`).
+  ///
+  /// This is the explicit-format counterpart to the auto-routing
+  /// [`Self::from_dir`]: use it when you already know the checkpoint is an MLX
+  /// safetensors file and where it lives. There is no ONNX fallback — this
+  /// constructor always builds the MLX backend.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub fn from_safetensors(weights: &Path) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_safetensors(weights)?;
+    let tokenizer =
+      prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
+    Ok(Self {
+      backend: TextBackend::Mlx { model, tokenizer },
+    })
+  }
+
+  /// Load the **MLX** text tower from an exact `*.npz` file path (Apple Silicon
+  /// only). The `config.json` (and optional `1_Pooling`) and the `tokenizer.json`
+  /// are read from the weight file's parent directory (`weights.parent()`).
+  ///
+  /// Explicit-format MLX constructor (see [`Self::from_safetensors`]); always
+  /// builds the MLX backend, no ONNX fallback.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz"))]
+  pub fn from_npz(weights: &Path) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_npz(weights)?;
+    let tokenizer =
+      prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
+    Ok(Self {
+      backend: TextBackend::Mlx { model, tokenizer },
+    })
+  }
+
+  /// Load the **MLX** text tower from an exact `*.gguf` file path (Apple Silicon
+  /// only). The `config.json` (and optional `1_Pooling`) and the `tokenizer.json`
+  /// are read from the weight file's parent directory (`weights.parent()`); the
+  /// gguf's embedded metadata is NOT mapped to a config, so a sibling
+  /// `config.json` is still required.
+  ///
+  /// Explicit-format MLX constructor (see [`Self::from_safetensors`]); always
+  /// builds the MLX backend, no ONNX fallback.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf"))]
+  pub fn from_gguf(weights: &Path) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_gguf(weights)?;
+    let tokenizer =
+      prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
+    Ok(Self {
+      backend: TextBackend::Mlx { model, tokenizer },
+    })
+  }
+
   /// Encode a single string and return its 768-dim L2-normalized
   /// [`Embedding`]. Empty input is rejected with [`Error::EmptyText`].
   /// For multiple inputs, prefer [`Self::embed_batch`] — it amortizes

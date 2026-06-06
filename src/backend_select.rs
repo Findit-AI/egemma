@@ -8,11 +8,12 @@
 //!
 //! Routing contract:
 //! - On **Apple Silicon**, `from_dir` prefers MLX when [`prefer_mlx`] is `true`
-//!   (an MLX `config.json` is present, a weight file in any ENABLED format is
-//!   present — `model.safetensors` always, a `*.npz` only under the `npz`
-//!   feature, a `*.gguf` only under the `gguf` feature — AND **none** of the
-//!   ONNX graph(s) the calling constructor needs is in the directory) and falls
-//!   back to ONNX otherwise. Routing is **per-constructor**: each `from_dir`
+//!   (an MLX `config.json` is present, a weight set in any ENABLED format is
+//!   present — a sharded `model.safetensors.index.json` or a single
+//!   `model.safetensors` always, a `*.npz` only under the `npz` feature, a
+//!   `*.gguf` only under the `gguf` feature — AND **none** of the ONNX graph(s)
+//!   the calling constructor needs is in the directory) and falls back to ONNX
+//!   otherwise. Routing is **per-constructor**: each `from_dir`
 //!   passes the graph(s) *it* loads, so the probe checks the graph the caller
 //!   actually needs — [`crate::TextEncoder::from_dir`] passes [`TEXT_ONNX`]. The
 //!   ONNX graph disambiguates: `config.json` + `model.safetensors` are also the
@@ -37,19 +38,40 @@ pub(crate) const MLX_CONFIG: &str = "config.json";
 
 /// The MLX-format safetensors weights file name — the always-available baseline
 /// weight format. Its presence (with [`MLX_CONFIG`]) is one signal `from_dir`
-/// routes to the MLX backend on Apple Silicon. Mirrors `crate::mlx`'s
-/// `SAFETENSORS_FILE`.
+/// routes to the MLX backend on Apple Silicon.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) const MLX_SAFETENSORS: &str = "model.safetensors";
 
-/// Report whether `dir` holds an MLX weight file in any ENABLED format:
-/// `model.safetensors` always; a `*.npz` only under the `npz` feature; a
-/// `*.gguf` only under the `gguf` feature. Mirrors the priority the loader's
-/// `load_weights` detector probes, so routing and loading agree on which formats
-/// count. A dir with only `model.npz` therefore routes to MLX iff `npz` is on.
+/// The legacy single-file safetensors weights name. Some older MLX checkpoints
+/// ship their weights as `weights.safetensors` rather than `model.safetensors`;
+/// `mlxrs::io::load_weights_from_dir` accepts it as a fallback tier, so its
+/// presence (with [`MLX_CONFIG`]) also routes to the MLX backend.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const MLX_SAFETENSORS_LEGACY: &str = "weights.safetensors";
+
+/// The sharded-checkpoint index file name. A multi-shard safetensors export
+/// (`model-00001-of-0000N.safetensors` + …) ships a `model.safetensors.index.json`
+/// weight map instead of a single `model.safetensors`; `mlxrs::io::load_weights_from_dir`
+/// loads it, so its presence (with [`MLX_CONFIG`]) also routes to MLX.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) const MLX_SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
+
+/// Report whether `dir` holds an MLX weight set in any ENABLED format:
+/// a sharded `model.safetensors.index.json` always; a single `model.safetensors`
+/// (or the legacy `weights.safetensors`) always; a `*.npz` only under the `npz`
+/// feature; a `*.gguf` only under the `gguf` feature. Mirrors the formats
+/// [`mlxrs::io::load_weights_from_dir`] loads, so routing and loading agree on
+/// which checkpoints count. A dir with only `model.npz` therefore routes to MLX
+/// iff `npz` is on.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn has_mlx_weights(dir: &std::path::Path) -> bool {
+  if dir.join(MLX_SAFETENSORS_INDEX).is_file() {
+    return true;
+  }
   if dir.join(MLX_SAFETENSORS).is_file() {
+    return true;
+  }
+  if dir.join(MLX_SAFETENSORS_LEGACY).is_file() {
     return true;
   }
   #[cfg(feature = "npz")]
@@ -127,6 +149,46 @@ mod tests {
       "config.json + model.safetensors present (no ONNX graph) must select MLX"
     );
     let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  /// A SHARDED MLX checkpoint — `config.json` + `model.safetensors.index.json`
+  /// (the weight map for a multi-shard export) with NO single `model.safetensors`
+  /// and no ONNX graph — is an MLX checkpoint: `prefer_mlx` routes it to MLX,
+  /// because `mlxrs::io::load_weights_from_dir` loads the sharded layout via the
+  /// index.
+  #[test]
+  fn prefer_mlx_true_for_sharded_index_only() {
+    let tmp = std::env::temp_dir().join(format!("egemma_mlx_probe_shard_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
+    std::fs::write(tmp.join(MLX_SAFETENSORS_INDEX), b"{}").expect("write index.json");
+    let routed = prefer_mlx(&tmp, &[TEXT_ONNX]);
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(
+      routed,
+      "config.json + model.safetensors.index.json (sharded, no ONNX graph) must select MLX"
+    );
+  }
+
+  /// A LEGACY single-file MLX checkpoint — `config.json` + `weights.safetensors`
+  /// (the older single-file name) with NO `model.safetensors` and no ONNX graph
+  /// — is an MLX checkpoint: `prefer_mlx` routes it to MLX, because
+  /// `mlxrs::io::load_weights_from_dir` accepts `weights.safetensors` as a
+  /// fallback tier.
+  #[test]
+  fn prefer_mlx_true_for_legacy_weights_safetensors() {
+    let tmp = std::env::temp_dir().join(format!("egemma_mlx_probe_legacy_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
+    std::fs::write(tmp.join(MLX_SAFETENSORS_LEGACY), b"\0").expect("write weights.safetensors");
+    let routed = prefer_mlx(&tmp, &[TEXT_ONNX]);
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(
+      routed,
+      "config.json + weights.safetensors (legacy single-file, no ONNX graph) must select MLX"
+    );
   }
 
   /// An ONNX-only directory (the `model.onnx` graph, no MLX `model.safetensors`)
