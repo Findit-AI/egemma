@@ -24,8 +24,8 @@ const PAD_TOKEN: &str = "<pad>";
 ///
 /// Holds either an ONNX Runtime session + tokenizer (the `ort` backend) or — on
 /// Apple Silicon, when [`Self::from_dir`] auto-routes to it — an `mlxrs` MLX
-/// model + tokenizer (the MLX backend), behind one public API. Both return the
-/// same 768-dim L2-normalized [`Embedding`].
+/// model + tokenizer (the MLX backend), behind one public API. Both return an
+/// L2-normalized [`Embedding`] (768-dim for the base export).
 ///
 /// Auto-trait reality is platform-conditional:
 /// - On every target **except** `aarch64-apple-darwin`: `Send + !Sync`. Only the
@@ -290,8 +290,9 @@ impl TextEncoder {
     })
   }
 
-  /// Encode a single string and return its 768-dim L2-normalized
-  /// [`Embedding`]. Empty input is rejected with [`Error::EmptyText`].
+  /// Encode a single string and return its L2-normalized [`Embedding`]
+  /// (768-dim for the base export). Empty input is rejected with
+  /// [`Error::EmptyText`].
   /// For multiple inputs, prefer [`Self::embed_batch`] — it amortizes
   /// the per-call ORT overhead across the batch.
   pub fn embed(&mut self, text: &str) -> Result<Embedding> {

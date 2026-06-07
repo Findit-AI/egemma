@@ -14,6 +14,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - MLX backend now truncates inputs longer than `max_seq_len` (default 2048);
   previously the MLX path did not truncate. Use the upcoming windowing API for
   full long-input coverage.
+- `Embedding` is now runtime-dimensioned: `Embedding::EMBED_DIM` is removed
+  (use `Embedding::dim()`; `Embedding::DEFAULT_DIM` documents the 768 base).
+  `from_model_output` / `TryFrom<Vec<f32>>` accept any non-empty unit-norm
+  length, enabling Matryoshka (128/256/512) checkpoints end-to-end.
 
 ### Added
 
@@ -22,6 +26,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   (feature-gated) `from_npz_with_options` / `from_gguf_with_options`.
 - `Error::BackendUnavailable` for an unsatisfiable forced backend.
 - `MlxErrorKind { Config, Load, Runtime }` tags on MLX failures.
+- `Embedding::to_matryoshka(dim)` — prefix-truncate + renormalize a 768-d
+  embedding to a shorter Matryoshka dimension.
+- `Embedding::DEFAULT_DIM` — documentation constant for the 768 base-export
+  dimension (replaces the removed `EMBED_DIM`).
 
 ## [0.1.0]
 

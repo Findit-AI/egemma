@@ -92,13 +92,14 @@ pub enum Error {
     got: ort::value::TensorElementType,
   },
 
-  /// `Embedding` constructed from a `Vec<f32>` whose length didn't
-  /// equal [`crate::Embedding::EMBED_DIM`] (768).
+  /// An embedding dimension didn't match the expected dimension (e.g.
+  /// `try_cosine` operands of differing length, or `to_matryoshka` given a
+  /// `dim` larger than the source).
   #[error("embedding dimension mismatch: expected {expected}, got {got}")]
   EmbeddingDim {
-    /// Required dim (always 768 in 0.1.0).
+    /// The dimension that was required/compared against.
     expected: usize,
-    /// Caller-supplied dim.
+    /// The actual dimension supplied.
     got: usize,
   },
 

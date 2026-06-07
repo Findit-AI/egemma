@@ -13,7 +13,7 @@
 //! the platform auto-routing in [`crate::TextEncoder::from_dir`] (which probes
 //! the checkpoint directory and picks MLX when an MLX checkpoint is present),
 //! never a user-facing backend knob. Both backends expose the **same** public
-//! API and return the same [`crate::Embedding`] (768-dim, L2-normalized).
+//! API and return the same [`crate::Embedding`] (L2-normalized; dimension per the checkpoint).
 //!
 //! # Weight source
 //!
@@ -516,9 +516,8 @@ fn eval_rows(arr: &mlxrs::Array, rows: usize) -> Result<Vec<Vec<f32>>> {
 /// Wrap one model-output row into an [`Embedding`].
 ///
 /// `mlxrs`'s `encode_text` L2-normalizes its output, so the row is unit-norm to
-/// f32 ULP; [`Embedding::from_model_output`] validates the dim (768) and
-/// renormalizes (snapping tiny f32 drift), the same validated path the ONNX
-/// backend's rows take.
+/// f32 ULP; [`Embedding::from_model_output`] renormalizes (snapping tiny f32
+/// drift), the same validated path the ONNX backend's rows take.
 fn embedding_from_row(row: Vec<f32>) -> Result<Embedding> {
   Embedding::from_model_output(&row)
 }
