@@ -1,7 +1,8 @@
 //! Checkpoint-directory layout constants + the Apple-Silicon backend probe.
 //!
-//! [`crate::TextEncoder::from_dir`] picks its inference backend automatically —
-//! there is no user-facing knob. This module owns the small amount of shared
+//! [`crate::TextEncoder::from_dir`] picks its inference backend automatically;
+//! [`crate::TextEncoder::from_dir_with_options`] accepts an explicit
+//! [`crate::options::Backend`] override. This module owns the small amount of shared
 //! logic that decision needs: the canonical file names a checkpoint directory
 //! holds, and (on `aarch64-apple-darwin`) the probe that decides whether a
 //! directory is an MLX checkpoint worth routing to the `mlxrs` Metal backend.
@@ -103,6 +104,72 @@ fn has_extension(dir: &std::path::Path, extension: &str) -> bool {
   })
 }
 
+/// The backend [`route`] selected for a checkpoint directory.
+#[cfg(all(feature = "inference", not(target_arch = "wasm32")))]
+pub(crate) enum Routed {
+  /// Load via ONNX Runtime.
+  Onnx,
+  /// Load via the MLX backend.
+  Mlx,
+}
+
+/// Decide which backend to load for `dir`, honoring an explicit
+/// [`crate::options::Backend`]. `Auto` uses the [`prefer_mlx`] probe; `Onnx`
+/// forces ONNX; `Mlx` forces MLX and errors with
+/// [`crate::Error::BackendUnavailable`] when the directory holds no MLX
+/// checkpoint.
+#[cfg(all(feature = "inference", not(target_arch = "wasm32"), target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn route(
+  dir: &std::path::Path,
+  backend: crate::options::Backend,
+  required_onnx: &[&str],
+) -> Result<Routed, crate::Error> {
+  use crate::options::Backend;
+  match backend {
+    Backend::Auto => Ok(if prefer_mlx(dir, required_onnx) {
+      Routed::Mlx
+    } else {
+      Routed::Onnx
+    }),
+    Backend::Onnx => Ok(Routed::Onnx),
+    Backend::Mlx => {
+      if dir.join(MLX_CONFIG).is_file() && has_mlx_weights(dir) {
+        Ok(Routed::Mlx)
+      } else {
+        Err(crate::Error::BackendUnavailable {
+          requested: Backend::Mlx,
+          reason: format!(
+            "no MLX checkpoint (config.json + a weight file) in {}",
+            dir.display()
+          ),
+        })
+      }
+    }
+  }
+}
+
+/// Off Apple Silicon only the ONNX backend exists, so `Auto`/`Onnx` route to
+/// ONNX and `Mlx` is unavailable.
+#[cfg(all(
+  feature = "inference",
+  not(target_arch = "wasm32"),
+  not(all(target_os = "macos", target_arch = "aarch64"))
+))]
+pub(crate) fn route(
+  _dir: &std::path::Path,
+  backend: crate::options::Backend,
+  _required_onnx: &[&str],
+) -> Result<Routed, crate::Error> {
+  use crate::options::Backend;
+  match backend {
+    Backend::Auto | Backend::Onnx => Ok(Routed::Onnx),
+    Backend::Mlx => Err(crate::Error::BackendUnavailable {
+      requested: Backend::Mlx,
+      reason: "the MLX backend is only available on aarch64-apple-darwin".to_string(),
+    }),
+  }
+}
+
 /// Probe `dir` and report whether the MLX backend should load it for the calling
 /// constructor: `true` iff it contains an MLX `config.json` and a weight file in
 /// any enabled format (see [`has_mlx_weights`]) AND **none** of `required_onnx`
@@ -128,6 +195,50 @@ pub(crate) fn prefer_mlx(dir: &std::path::Path, required_onnx: &[&str]) -> bool 
   dir.join(MLX_CONFIG).is_file()
     && has_mlx_weights(dir)
     && !required_onnx.iter().any(|onnx| dir.join(onnx).is_file())
+}
+
+#[cfg(all(test, feature = "inference", not(target_arch = "wasm32")))]
+mod route_tests {
+  use super::*;
+  use crate::options::Backend;
+
+  #[test]
+  fn route_onnx_is_always_onnx() {
+    let tmp = std::env::temp_dir().join(format!("egemma_route_onnx_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("mkdir");
+    // Force ONNX must route ONNX regardless of contents.
+    let r = route(&tmp, Backend::Onnx, &[TEXT_ONNX]).expect("onnx route ok");
+    assert!(matches!(r, Routed::Onnx));
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+  #[test]
+  fn route_mlx_unavailable_off_apple_silicon() {
+    let tmp = std::env::temp_dir().join(format!("egemma_route_mlx_off_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("mkdir");
+    let err = route(&tmp, Backend::Mlx, &[TEXT_ONNX])
+      .err()
+      .expect("forcing Mlx off Apple Silicon must error");
+    assert!(matches!(err, crate::Error::BackendUnavailable { .. }));
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[test]
+  fn route_mlx_unavailable_when_no_mlx_checkpoint() {
+    let tmp = std::env::temp_dir().join(format!("egemma_route_mlx_empty_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("mkdir");
+    // Empty dir: forcing Mlx must error (no config.json + weights).
+    let err = route(&tmp, Backend::Mlx, &[TEXT_ONNX])
+      .err()
+      .expect("forcing Mlx with no checkpoint must error");
+    assert!(matches!(err, crate::Error::BackendUnavailable { .. }));
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]

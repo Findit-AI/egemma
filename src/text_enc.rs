@@ -125,7 +125,8 @@ impl TextEncoder {
   }
 
   /// Load the text tower from a **checkpoint directory**, automatically picking
-  /// the best backend for the platform — there is no backend knob.
+  /// the best backend for the platform. This entry point auto-routes; use
+  /// [`Self::from_dir_with_options`] to force a specific [`crate::options::Backend`].
   ///
   /// On Apple Silicon (`aarch64-apple-darwin`) the directory is probed and
   /// routes to the `mlxrs` **MLX** Metal backend when the text ONNX graph this
@@ -139,22 +140,45 @@ impl TextEncoder {
   /// see [`Self::from_files`]).
   #[cfg(not(target_arch = "wasm32"))]
   pub fn from_dir(dir: &Path) -> Result<Self> {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if crate::backend_select::prefer_mlx(dir, &[crate::backend_select::TEXT_ONNX]) {
-      return Self::from_mlx_dir(dir);
-    }
-    Self::from_onnx_dir(dir)
+    Self::from_dir_with_options(dir, Options::default())
   }
 
-  /// ONNX dispatch target for [`Self::from_dir`]: load the text ONNX graph
-  /// (`crate::backend_select`'s `TEXT_ONNX`) + the directory's `tokenizer.json`.
-  /// Crate-internal — the user's directory entry point is [`Self::from_dir`].
+  /// Like [`Self::from_dir`] but with explicit [`Options`], including the
+  /// [`crate::options::Backend`] selector. Routes per `opts.backend()`.
   #[cfg(not(target_arch = "wasm32"))]
-  pub(crate) fn from_onnx_dir(dir: &Path) -> Result<Self> {
-    Self::from_files(
+  pub fn from_dir_with_options(dir: &Path, opts: Options) -> Result<Self> {
+    use crate::backend_select::{route, Routed, TEXT_ONNX};
+    match route(dir, opts.backend(), &[TEXT_ONNX])? {
+      Routed::Onnx => Self::from_onnx_dir_with_options(dir, opts),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      Routed::Mlx => Self::from_mlx_dir_with_options(dir, opts),
+      // `route` never returns `Mlx` off Apple Silicon; keep the match total
+      // without a panic.
+      #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+      Routed::Mlx => Err(Error::BackendUnavailable {
+        requested: crate::options::Backend::Mlx,
+        reason: "the MLX backend is only available on aarch64-apple-darwin".to_string(),
+      }),
+    }
+  }
+
+  /// ONNX dispatch target for [`Self::from_dir_with_options`]: load the text
+  /// ONNX graph (`crate::backend_select`'s `TEXT_ONNX`) + the directory's
+  /// `tokenizer.json` with the given [`Options`].
+  #[cfg(not(target_arch = "wasm32"))]
+  pub(crate) fn from_onnx_dir_with_options(dir: &Path, opts: Options) -> Result<Self> {
+    Self::from_files_with_options(
       &dir.join(crate::backend_select::TEXT_ONNX),
       &dir.join("tokenizer.json"),
+      opts,
     )
+  }
+
+  // Temporary shim: ignores `opts` and builds the MLX backend with crate
+  // defaults. The real `Options`-honoring body lands in Task 5.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub(crate) fn from_mlx_dir_with_options(dir: &Path, _opts: Options) -> Result<Self> {
+    Self::from_mlx_dir(dir)
   }
 
   /// MLX dispatch target for [`Self::from_dir`]: load from an **MLX checkpoint
