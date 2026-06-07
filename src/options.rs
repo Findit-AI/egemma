@@ -15,6 +15,27 @@ pub use ort::session::builder::GraphOptimizationLevel;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+/// Which inference backend [`crate::TextEncoder::from_dir`] (and
+/// [`crate::TextEncoder::from_dir_with_options`]) should use.
+///
+/// `Auto` keeps the current behavior: probe the checkpoint directory and pick
+/// MLX on Apple Silicon when an MLX checkpoint is present, else ONNX. `Onnx`
+/// forces the ONNX Runtime backend. `Mlx` forces the `mlxrs` MLX backend and
+/// errors with [`crate::Error::BackendUnavailable`] off Apple Silicon or when no
+/// MLX checkpoint is present.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Backend {
+  /// Probe the directory and pick the best backend for the platform.
+  #[default]
+  Auto,
+  /// Force the ONNX Runtime backend.
+  Onnx,
+  /// Force the MLX backend (Apple Silicon only).
+  Mlx,
+}
+
 // `optimization_level`'s `serialize` / `deserialize` adapters depend on
 // both `inference` (for the `GraphOptimizationLevel` type itself) and
 // `serde` (for the trait machinery). `Options::optimization_level`
@@ -358,6 +379,8 @@ pub struct Options {
   batch: BatchOptions,
   #[cfg_attr(feature = "serde", serde(default))]
   threads: ThreadOptions,
+  #[cfg_attr(feature = "serde", serde(default))]
+  backend: Backend,
 }
 
 impl Options {
@@ -371,6 +394,7 @@ impl Options {
       optimization_level: GraphOptimizationLevel::Level1,
       batch: BatchOptions::new(),
       threads: ThreadOptions::new(),
+      backend: Backend::Auto,
     }
   }
 
@@ -438,6 +462,27 @@ impl Options {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_threads(&mut self, t: ThreadOptions) -> &mut Self {
     self.threads = t;
+    self
+  }
+
+  /// The selected inference [`Backend`] (default [`Backend::Auto`]).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn backend(&self) -> Backend {
+    self.backend
+  }
+
+  /// Returns a copy with [`Self::backend`] replaced.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_backend(mut self, b: Backend) -> Self {
+    self.backend = b;
+    self
+  }
+
+  /// In-place setter for [`Self::backend`]; returns `&mut self` so calls can
+  /// chain.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_backend(&mut self, b: Backend) -> &mut Self {
+    self.backend = b;
     self
   }
 }
@@ -518,6 +563,19 @@ mod tests {
     BatchOptions::default()
       .validate()
       .expect("default BatchOptions must validate (8 / 1024)");
+  }
+
+  #[test]
+  fn backend_defaults_to_auto() {
+    assert_eq!(Options::default().backend(), Backend::Auto);
+  }
+
+  #[test]
+  fn with_backend_overrides_and_is_copy() {
+    let o = Options::default().with_backend(Backend::Onnx);
+    assert_eq!(o.backend(), Backend::Onnx);
+    let _copy = o; // Options must stay Copy
+    assert_eq!(o.backend(), Backend::Onnx);
   }
 
   #[cfg(all(feature = "inference", feature = "serde"))]
