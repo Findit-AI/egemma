@@ -164,3 +164,74 @@ fn empty_text_rejected() {
   let err = encoder.embed("").expect_err("empty text must error");
   assert!(matches!(err, egemma::Error::EmptyText));
 }
+
+/// Verify that a long input (concatenated paragraphs that exceed the model's
+/// `max_seq_len` context window) is split into more than one window, each
+/// returning a 768-dim unit-norm embedding, with byte spans that index back
+/// into the original text and cover it from start to end.
+#[cfg(feature = "windowing")]
+#[test]
+fn embed_windows_long_input_produces_multiple_windows() {
+  let Some(mut encoder) = try_load_encoder("embed_windows_long_input_produces_multiple_windows")
+  else {
+    return;
+  };
+
+  // Build a text long enough to span multiple windows. Repeat a paragraph
+  // until we exceed ~4 000 tokens (well above the 2048 default `max_seq_len`).
+  let paragraph = "The quick brown fox jumps over the lazy dog. \
+    Machine learning models process text by converting words into numerical \
+    representations called embeddings, which capture semantic meaning. ";
+  let long_text: String = paragraph.repeat(80);
+
+  let opts = egemma::WindowOptions::new(egemma::WindowStrategy::FixedToken);
+  let windows = encoder
+    .embed_windows(&long_text, &opts)
+    .expect("embed_windows must succeed on a long input");
+
+  assert!(
+    windows.len() > 1,
+    "expected more than one window for a long input, got {}",
+    windows.len()
+  );
+
+  for (i, w) in windows.iter().enumerate() {
+    assert_eq!(
+      w.embedding.dim(),
+      768,
+      "window {i}: expected dim 768, got {}",
+      w.embedding.dim()
+    );
+    let cos = w
+      .embedding
+      .try_cosine(&w.embedding)
+      .expect("self-cosine on valid embedding");
+    assert!(
+      (cos - 1.0).abs() < 1e-4,
+      "window {i}: self-cosine should be 1.0; got {cos}"
+    );
+    assert!(
+      w.byte_span.end <= long_text.len(),
+      "window {i}: byte_span.end {} out of bounds (text len {})",
+      w.byte_span.end,
+      long_text.len()
+    );
+    assert!(
+      w.byte_span.start < w.byte_span.end,
+      "window {i}: degenerate span {:?}",
+      w.byte_span
+    );
+  }
+
+  // Full-text coverage: the first window starts at byte 0, and the last reaches
+  // the final non-whitespace byte (trailing whitespace isn't its own token).
+  assert_eq!(
+    windows.first().unwrap().byte_span.start,
+    0,
+    "first window should start at byte 0"
+  );
+  assert!(
+    windows.last().unwrap().byte_span.end >= long_text.trim_end().len(),
+    "last window should reach the final non-whitespace byte"
+  );
+}

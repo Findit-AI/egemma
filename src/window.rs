@@ -84,7 +84,6 @@ pub struct WindowEmbedding {
 /// `opts.size().unwrap_or(max_seq_len).saturating_sub(special_reserve)` so a
 /// re-embedded chunk (which re-adds `special_reserve` special tokens) stays
 /// within `max_seq_len`.
-#[allow(dead_code)]
 pub(crate) fn split_windows(
   tokenizer: &Tokenizer,
   text: &str,

@@ -20,6 +20,13 @@ use crate::{
 const EMBED_DIM: usize = 768;
 const PAD_TOKEN: &str = "<pad>";
 
+/// Fallback `max_seq_len` for windowing when a tokenizer carries no truncation
+/// params. Not reachable via public constructors (both backends set truncation
+/// at construction); mirrors `options::BatchOptions::new()` / embedding-gemma's
+/// trained context window.
+#[cfg(feature = "windowing")]
+const DEFAULT_MAX_SEQ_LEN: usize = 2048;
+
 /// `embedding-gemma` text-tower inference.
 ///
 /// Holds either an ONNX Runtime session + tokenizer (the `ort` backend) or — on
@@ -363,6 +370,157 @@ impl TextEncoder {
     let _ = self.embed("warmup")?;
     Ok(())
   }
+
+  /// Return a non-truncating tokenizer clone, the encoder's `max_seq_len`, and
+  /// the number of special tokens the post-processor adds per single sequence.
+  ///
+  /// Both backends configure their tokenizers with truncation enabled (the ORT
+  /// path via [`configure_tokenizer`], the MLX path via
+  /// [`configure_mlx_tokenizer`]). This helper clones the tokenizer, reads
+  /// `max_seq_len` off the truncation params before clearing them, and queries
+  /// the post-processor for the special-token overhead. The windowing path uses
+  /// the non-truncating clone to split the full text; `max_seq_len` and
+  /// `special_reserve` size the per-window budget so each re-embedded chunk
+  /// stays within `max_seq_len`.
+  #[cfg(feature = "windowing")]
+  fn split_tokenizer(&self) -> (Tokenizer, usize, usize) {
+    use tokenizers::PostProcessor as _;
+    let raw = match &self.backend {
+      TextBackend::Ort(ort) => ort.tokenizer.clone(),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      TextBackend::Mlx { tokenizer, .. } => tokenizer.clone(),
+    };
+    // Read max_seq_len from the tokenizer's truncation params BEFORE clearing
+    // them. Both backends set truncation at construction with `max_length =
+    // opts.batch().max_seq_len()`, so this is the authoritative source.
+    let max_seq_len = raw
+      .get_truncation()
+      .map(|t| t.max_length)
+      .unwrap_or(DEFAULT_MAX_SEQ_LEN);
+    // Disable truncation so the clone tokenizes the full text for splitting.
+    let mut tok = raw;
+    let _ = tok.with_truncation(None);
+    // Number of special tokens the post-processor adds for a single sequence
+    // (not a pair). We subtract this from the per-window budget so a
+    // re-embedded chunk — which re-adds these tokens — never exceeds
+    // `max_seq_len`.
+    let special_reserve = tok
+      .get_post_processor()
+      .map(|p| p.added_tokens(false))
+      .unwrap_or(0);
+    (tok, max_seq_len, special_reserve)
+  }
+
+  /// Embed a long `text` as overlapping windows (see [`crate::WindowOptions`]).
+  /// Returns one [`crate::WindowEmbedding`] per window, in order. Unlike
+  /// [`Self::embed`] (which truncates to the model's `max_seq_len`), this method
+  /// covers the whole input: it splits the text into token-budgeted chunks and
+  /// runs each through `embed_batch`.
+  ///
+  /// Returns [`Error::EmptyText`] for an empty `text`. Returns an empty `Vec`
+  /// when the text tokenizes to zero tokens (e.g. whitespace-only with a
+  /// whitespace-splitting tokenizer).
+  #[cfg(feature = "windowing")]
+  pub fn embed_windows(
+    &mut self,
+    text: &str,
+    opts: &crate::window::WindowOptions,
+  ) -> Result<Vec<crate::window::WindowEmbedding>> {
+    if text.is_empty() {
+      return Err(Error::EmptyText);
+    }
+    let (tok, max_seq_len, reserve) = self.split_tokenizer();
+    let chunks = crate::window::split_windows(&tok, text, opts, max_seq_len, reserve)?;
+    if chunks.is_empty() {
+      return Ok(Vec::new());
+    }
+    let texts: Vec<&str> = chunks.iter().map(|(_, s)| s.as_str()).collect();
+    let embs = self.embed_batch(&texts)?;
+    Ok(
+      chunks
+        .into_iter()
+        .zip(embs)
+        .map(
+          |((byte_span, _), embedding)| crate::window::WindowEmbedding {
+            byte_span,
+            embedding,
+          },
+        )
+        .collect(),
+    )
+  }
+
+  /// Embed a long `text` as a single vector: the token-weighted mean of its
+  /// window embeddings, renormalized. An approximation of a full-document
+  /// mean-pool — overlap tokens are double-counted. Use [`Self::embed_windows`]
+  /// for the exact per-window vectors.
+  ///
+  /// Returns [`Error::EmptyText`] for an empty `text`, and [`Error::EmbeddingDim`]
+  /// when `text` tokenizes to zero real tokens (e.g. whitespace-only).
+  #[cfg(feature = "windowing")]
+  pub fn embed_pooled(
+    &mut self,
+    text: &str,
+    opts: &crate::window::WindowOptions,
+  ) -> Result<Embedding> {
+    if text.is_empty() {
+      return Err(Error::EmptyText);
+    }
+    let (tok, max_seq_len, reserve) = self.split_tokenizer();
+    let chunks = crate::window::split_windows(&tok, text, opts, max_seq_len, reserve)?;
+    let texts: Vec<&str> = chunks.iter().map(|(_, s)| s.as_str()).collect();
+    let embs = self.embed_batch(&texts)?;
+    let weighted: Vec<(usize, Embedding)> = chunks
+      .iter()
+      .zip(embs)
+      .map(|((_, s), e)| {
+        let n = tok
+          .encode(s.as_str(), false)
+          .map(|enc| enc.get_ids().len())
+          .unwrap_or(1);
+        (n.max(1), e)
+      })
+      .collect();
+    pool_weighted(&weighted)
+  }
+}
+
+/// Token-weighted mean pooling over window embeddings, followed by L2
+/// renormalization.
+///
+/// Computes `Σ nᵢ·vᵢ` componentwise, divides by `Σ nᵢ`, then passes the
+/// result through [`Embedding::from_model_output`] (which renormalizes to unit
+/// L2 norm). Returns [`Error::EmbeddingDim`] for an empty input or when any
+/// two rows have different dimensions.
+#[cfg(feature = "windowing")]
+fn pool_weighted(rows: &[(usize, Embedding)]) -> Result<Embedding> {
+  let Some((_first_n, first_emb)) = rows.first() else {
+    return Err(Error::EmbeddingDim {
+      expected: 1,
+      got: 0,
+    });
+  };
+  let dim = first_emb.dim();
+  let mut accum = vec![0.0f32; dim];
+  let mut total_n = 0usize;
+  for (n, emb) in rows {
+    if emb.dim() != dim {
+      return Err(Error::EmbeddingDim {
+        expected: dim,
+        got: emb.dim(),
+      });
+    }
+    let weight = *n as f32;
+    total_n += n;
+    for (a, &v) in accum.iter_mut().zip(emb.as_slice()) {
+      *a += weight * v;
+    }
+  }
+  let inv = 1.0 / total_n as f32;
+  for a in &mut accum {
+    *a *= inv;
+  }
+  Embedding::from_model_output(&accum)
 }
 
 impl OrtTextEncoder {
@@ -719,6 +877,30 @@ pub(crate) fn prepare_mlx_tokenizer(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// `pool_weighted` must compute the token-weighted mean of its input
+  /// embeddings and renormalize. Two orthogonal unit vectors with equal
+  /// token count sum to a 45° bisector; after renormalization each
+  /// component should be `1/√2`.
+  #[cfg(feature = "windowing")]
+  #[test]
+  fn pool_weighted_is_token_weighted_mean_then_renormalized() {
+    use crate::Embedding;
+    let a = Embedding::try_from(vec![1.0f32, 0.0]).unwrap();
+    let b = Embedding::try_from(vec![0.0f32, 1.0]).unwrap();
+    let pooled = pool_weighted(&[(1, a), (1, b)]).unwrap();
+    let inv = 1.0f32 / 2.0f32.sqrt();
+    assert!(
+      (pooled.as_slice()[0] - inv).abs() < 1e-4,
+      "expected component 0 ≈ {inv}, got {}",
+      pooled.as_slice()[0]
+    );
+    assert!(
+      (pooled.as_slice()[1] - inv).abs() < 1e-4,
+      "expected component 1 ≈ {inv}, got {}",
+      pooled.as_slice()[1]
+    );
+  }
 
   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
   #[test]
