@@ -116,6 +116,19 @@ pub enum Error {
     max: usize,
   },
 
+  /// A specific [`crate::options::Backend`] was requested via
+  /// [`crate::Options::with_backend`] but cannot be honored — e.g.
+  /// [`Backend::Mlx`](crate::options::Backend::Mlx) on a non-Apple-Silicon
+  /// target, or when the directory holds no checkpoint for the requested
+  /// backend.
+  #[error("requested backend {requested:?} is unavailable: {reason}")]
+  BackendUnavailable {
+    /// The backend the caller asked for.
+    requested: crate::options::Backend,
+    /// Why it could not be honored.
+    reason: String,
+  },
+
   /// `BatchOptions::batch_size` was outside the legal range
   /// `1..=max_batch_size` at encoder construction.
   #[error("invalid batch_size {batch_size}: must be in 1..={max_batch_size}")]
@@ -242,5 +255,16 @@ mod tests {
       err.to_string(),
       "embedding dimension mismatch: expected 768, got 512"
     );
+  }
+
+  #[test]
+  fn backend_unavailable_displays_requested_and_reason() {
+    let e = Error::BackendUnavailable {
+      requested: crate::options::Backend::Mlx,
+      reason: "not apple silicon".to_string(),
+    };
+    let msg = e.to_string();
+    assert!(msg.contains("Mlx"), "got {msg:?}");
+    assert!(msg.contains("not apple silicon"), "got {msg:?}");
   }
 }
