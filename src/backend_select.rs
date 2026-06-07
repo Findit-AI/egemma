@@ -244,6 +244,24 @@ mod route_tests {
     assert!(matches!(err, crate::Error::BackendUnavailable { .. }));
     let _ = std::fs::remove_dir_all(&tmp);
   }
+
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[test]
+  fn route_onnx_forced_over_present_mlx_checkpoint() {
+    let tmp = std::env::temp_dir().join(format!("egemma_route_force_onnx_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("mkdir");
+    // An MLX checkpoint (config.json + model.safetensors) IS present, but
+    // forcing Onnx must still route Onnx — bypassing the prefer_mlx probe.
+    std::fs::write(tmp.join(MLX_CONFIG), b"{}").expect("write config.json");
+    std::fs::write(tmp.join(MLX_SAFETENSORS), b"\0").expect("write model.safetensors");
+    let r = route(&tmp, Backend::Onnx, &[TEXT_ONNX]).expect("forced onnx ok");
+    assert!(
+      matches!(r, Routed::Onnx),
+      "Backend::Onnx must bypass MLX detection even with an MLX checkpoint present"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
