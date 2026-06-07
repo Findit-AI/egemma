@@ -26,6 +26,29 @@ pub(crate) fn dot_768(a: &[f32; 768], b: &[f32; 768]) -> f32 {
   acc[0] + acc[1] + acc[2] + acc[3]
 }
 
+/// Safe length-generic f32 dot product. Four independent accumulators so the
+/// reduction auto-vectorizes under `-O3`; the remainder (len % 4) is folded in
+/// scalar. Precondition: `a.len() == b.len()` (callers ensure this; on a
+/// mismatch the shorter length is used via `zip`, never an out-of-bounds read).
+#[allow(dead_code)]
+#[cfg_attr(not(tarpaulin), inline(always))]
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+  let mut acc = [0.0f32; 4];
+  let chunks = a.len() / 4;
+  for c in 0..chunks {
+    let i = c * 4;
+    acc[0] += a[i] * b[i];
+    acc[1] += a[i + 1] * b[i + 1];
+    acc[2] += a[i + 2] * b[i + 2];
+    acc[3] += a[i + 3] * b[i + 3];
+  }
+  let mut sum = acc[0] + acc[1] + acc[2] + acc[3];
+  for i in (chunks * 4)..a.len() {
+    sum += a[i] * b[i];
+  }
+  sum
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -53,5 +76,21 @@ mod tests {
     // 768 × 0.5 × 0.25 = 96.0
     let got = dot_768(&a, &b);
     assert!((got - 96.0).abs() < 1e-4, "expected ≈96.0, got {got}");
+  }
+
+  #[test]
+  fn generic_dot_matches_manual_sum_various_lengths() {
+    for len in [1usize, 3, 8, 100, 256, 512, 768] {
+      let a: Vec<f32> = (0..len).map(|i| (i as f32) * 0.01).collect();
+      let b: Vec<f32> = (0..len).map(|i| (i as f32).sin()).collect();
+      let manual: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+      let got = dot(&a, &b);
+      assert!((manual - got).abs() < 1e-3, "len {len}: {got} vs {manual}");
+    }
+  }
+
+  #[test]
+  fn generic_dot_empty_is_zero() {
+    assert_eq!(dot(&[], &[]), 0.0);
   }
 }

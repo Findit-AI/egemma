@@ -90,6 +90,23 @@ fn dot_768_dispatch(a: &[f32; 768], b: &[f32; 768]) -> f32 {
   scalar::dot_768(a, b)
 }
 
+/// Length-generic f32 dot product. Routes the common 768-d case through the
+/// hand-tuned [`dot_768`] fast path; every other length uses the safe scalar
+/// generic [`scalar::dot`]. Precondition: `a.len() == b.len()`.
+#[allow(dead_code)]
+#[cfg_attr(not(tarpaulin), inline(always))]
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+  debug_assert_eq!(a.len(), b.len(), "dot operands must have equal length");
+  if a.len() == 768 {
+    // SAFETY-FREE: lengths are exactly 768, so the array refs are valid.
+    let a768: &[f32; 768] = a.try_into().expect("len checked == 768");
+    let b768: &[f32; 768] = b.try_into().expect("len checked == 768");
+    dot_768(a768, b768)
+  } else {
+    scalar::dot(a, b)
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -144,5 +161,19 @@ mod tests {
       arr.is_err(),
       "100-element slice must not convert to [f32; 768]"
     );
+  }
+
+  #[test]
+  fn dot_dispatch_matches_scalar_for_768_and_other() {
+    for len in [256usize, 512, 768] {
+      let a: Vec<f32> = (0..len).map(|i| ((i as f32) * 0.013).sin()).collect();
+      let b: Vec<f32> = (0..len).map(|i| ((i as f32) * 0.017).cos()).collect();
+      let s = scalar::dot(&a, &b);
+      let d = dot(&a, &b);
+      assert!(
+        (s - d).abs() < 1e-3,
+        "len {len}: dispatch {d} vs scalar {s}"
+      );
+    }
   }
 }
