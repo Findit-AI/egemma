@@ -419,7 +419,9 @@ impl TextEncoder {
   ///
   /// Returns [`Error::EmptyText`] for an empty `text`. Returns an empty `Vec`
   /// when the text tokenizes to zero tokens (e.g. whitespace-only with a
-  /// whitespace-splitting tokenizer).
+  /// whitespace-splitting tokenizer). May return [`Error::BatchTooLarge`] if the
+  /// text yields more windows than `BatchOptions::max_batch_size` (reduce
+  /// overlap or raise the cap via [`Options`]).
   #[cfg(feature = "windowing")]
   pub fn embed_windows(
     &mut self,
@@ -455,8 +457,10 @@ impl TextEncoder {
   /// mean-pool — overlap tokens are double-counted. Use [`Self::embed_windows`]
   /// for the exact per-window vectors.
   ///
-  /// Returns [`Error::EmptyText`] for an empty `text`, and [`Error::EmbeddingDim`]
-  /// when `text` tokenizes to zero real tokens (e.g. whitespace-only).
+  /// Returns [`Error::EmptyText`] for an empty `text`, [`Error::EmbeddingDim`]
+  /// when `text` tokenizes to zero real tokens (e.g. whitespace-only), and
+  /// [`Error::BatchTooLarge`] if it yields more windows than
+  /// `BatchOptions::max_batch_size`.
   #[cfg(feature = "windowing")]
   pub fn embed_pooled(
     &mut self,

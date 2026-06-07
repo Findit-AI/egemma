@@ -12,7 +12,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 - `Error::Mlx(String)` is now `Error::Mlx { kind: MlxErrorKind, message: String }`.
 - MLX backend now truncates inputs longer than `max_seq_len` (default 2048);
-  previously the MLX path did not truncate. Use the upcoming windowing API for
+  previously the MLX path did not truncate. Use the `windowing` feature for
   full long-input coverage.
 - `Embedding` is now runtime-dimensioned: `Embedding::EMBED_DIM` is removed
   (use `Embedding::dim()`; `Embedding::DEFAULT_DIM` documents the 768 base).
@@ -30,6 +30,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   embedding to a shorter Matryoshka dimension.
 - `Embedding::DEFAULT_DIM` — documentation constant for the 768 base-export
   dimension (replaces the removed `EMBED_DIM`).
+- `windowing` feature (off by default): `TextEncoder::embed_windows` (per-window
+  vectors) and `embed_pooled` (token-weighted mean) for inputs longer than the
+  model window, with `WindowStrategy::{FixedToken, Semantic}` and configurable
+  size/overlap. Pulls `text-splitter` (+ ICU); enable with `--features windowing`.
 
 ## [0.1.0]
 

@@ -56,13 +56,15 @@ impl WindowOptions {
     self.overlap
   }
 
-  /// Set an explicit window size (max real tokens per window).
+  /// Set an explicit window size (max real tokens per window). A size of `0` is
+  /// clamped to a 1-token budget rather than rejected.
   pub const fn with_size(mut self, n: usize) -> Self {
     self.size = Some(n);
     self
   }
 
-  /// Set the token overlap between consecutive windows.
+  /// Set the token overlap between consecutive windows. An overlap `>=` the
+  /// window size clamps the step to 1 token per window (maximum overlap).
   pub const fn with_overlap(mut self, n: usize) -> Self {
     self.overlap = n;
     self
