@@ -13,7 +13,11 @@ use crate::{
   options::Options,
 };
 
-const EMBED_DIM: usize = Embedding::EMBED_DIM;
+/// The canonical EmbeddingGemma ONNX export's fixed output width. The ORT path
+/// validates the graph emits `[batch, EMBED_DIM]`; it is intentionally a local
+/// constant (not tied to `Embedding`'s now-runtime dimension) because the graph
+/// shape is fixed regardless of any Matryoshka truncation a caller applies.
+const EMBED_DIM: usize = 768;
 const PAD_TOKEN: &str = "<pad>";
 
 /// `embedding-gemma` text-tower inference.
@@ -783,7 +787,9 @@ mod tests {
   }
 
   #[test]
-  fn embed_dim_constant_matches_embedding_module() {
+  fn onnx_output_dim_is_768() {
+    // The canonical EmbeddingGemma ONNX export emits a fixed [batch, 768]
+    // `sentence_embedding`; the ORT path validates against this local const.
     assert_eq!(EMBED_DIM, 768);
   }
 

@@ -29,7 +29,7 @@
 //! name drift, dtype drift, dim drift) are already enforced at
 //! construction time by `validate_text_session` (see `src/text_enc.rs`),
 //! and the unit tests pin the constant assumptions (`PAD_TOKEN`,
-//! `EMBED_DIM`).
+//! the embedding width (768)).
 //!
 //! **Developer responsibility.** Before merging changes that touch
 //! `src/text_enc.rs`, `src/session.rs`, `src/simd/`, `src/embedding.rs`,
@@ -46,7 +46,7 @@
 
 use std::path::PathBuf;
 
-use egemma::{Embedding, TextEncoder};
+use egemma::TextEncoder;
 
 fn model_dir() -> Option<PathBuf> {
   std::env::var_os("EGEMMA_MODEL_DIR").map(PathBuf::from)
@@ -98,7 +98,7 @@ fn embed_single_returns_unit_norm_vector() {
   let e = encoder
     .embed("hello world")
     .expect("single embed must succeed");
-  assert_eq!(e.dim(), Embedding::EMBED_DIM);
+  assert_eq!(e.dim(), 768);
   let cos = e.try_cosine(&e).expect("self-cosine on valid embedding");
   assert!(
     (cos - 1.0).abs() < 1e-4,
@@ -115,7 +115,7 @@ fn embed_batch_preserves_order_and_self_cosine() {
   let embeddings = encoder.embed_batch(&prompts).expect("batch embed");
   assert_eq!(embeddings.len(), prompts.len());
   for e in &embeddings {
-    assert_eq!(e.dim(), Embedding::EMBED_DIM);
+    assert_eq!(e.dim(), 768);
     let cos = e.try_cosine(e).expect("self-cosine on valid embedding");
     assert!((cos - 1.0).abs() < 1e-4);
   }
