@@ -743,7 +743,7 @@ mod tests {
       .build()
       .unwrap();
     let mut tok = Tokenizer::new(model);
-    tok.with_pre_tokenizer(Some(Whitespace::default()));
+    tok.with_pre_tokenizer(Some(Whitespace));
 
     let configured = configure_mlx_tokenizer(tok, 3).expect("configure ok");
     let enc = configured.encode("a b c d e", false).expect("encode ok");

@@ -294,7 +294,7 @@ mod tests {
     assert!(msg.contains("not apple silicon"), "got {msg:?}");
   }
 
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
   #[test]
   fn mlx_error_displays_kind_and_message() {
     let e = Error::Mlx {
