@@ -147,7 +147,7 @@ impl TextEncoder {
   /// [`crate::options::Backend`] selector. Routes per `opts.backend()`.
   #[cfg(not(target_arch = "wasm32"))]
   pub fn from_dir_with_options(dir: &Path, opts: Options) -> Result<Self> {
-    use crate::backend_select::{route, Routed, TEXT_ONNX};
+    use crate::backend_select::{Routed, TEXT_ONNX, route};
     match route(dir, opts.backend(), &[TEXT_ONNX])? {
       Routed::Onnx => Self::from_onnx_dir_with_options(dir, opts),
       #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

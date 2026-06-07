@@ -62,7 +62,7 @@ use tokenizers::Tokenizer;
 
 use crate::{
   embedding::Embedding,
-  error::{Error, Result},
+  error::{Error, MlxErrorKind, Result},
 };
 
 /// The standard config file name inside an MLX checkpoint directory.
@@ -146,7 +146,7 @@ impl MlxModel {
   /// (or the feature-gated `from_npz` / `from_gguf`).
   pub(crate) fn from_dir(dir: &Path) -> Result<Self> {
     Self::construct(dir, || {
-      mlxrs::io::load_weights_from_dir(dir).map_err(Error::from_mlx)
+      mlxrs::io::load_weights_from_dir(dir).map_err(|e| Error::from_mlx(MlxErrorKind::Load, e))
     })
   }
 
@@ -155,7 +155,7 @@ impl MlxModel {
   /// weight file's parent directory (see [`weights_parent`]).
   pub(crate) fn from_safetensors(weights: &Path) -> Result<Self> {
     Self::construct(weights_parent(weights), || {
-      mlxrs::io::load_safetensors(weights).map_err(Error::from_mlx)
+      mlxrs::io::load_safetensors(weights).map_err(|e| Error::from_mlx(MlxErrorKind::Load, e))
     })
   }
 
@@ -165,7 +165,7 @@ impl MlxModel {
   #[cfg(feature = "npz")]
   pub(crate) fn from_npz(weights: &Path) -> Result<Self> {
     Self::construct(weights_parent(weights), || {
-      mlxrs::io::load_npz(weights).map_err(Error::from_mlx)
+      mlxrs::io::load_npz(weights).map_err(|e| Error::from_mlx(MlxErrorKind::Load, e))
     })
   }
 
@@ -178,7 +178,7 @@ impl MlxModel {
     Self::construct(weights_parent(weights), || {
       mlxrs::io::load_gguf(weights)
         .map(|(w, _meta)| w)
-        .map_err(Error::from_mlx)
+        .map_err(|e| Error::from_mlx(MlxErrorKind::Load, e))
     })
   }
 
@@ -198,7 +198,8 @@ impl MlxModel {
     let config_path = dir.join(CONFIG_FILE);
 
     let config_json = std::fs::read_to_string(&config_path)?;
-    let config = Gemma3Config::from_json(&config_json).map_err(Error::from_mlx)?;
+    let config = Gemma3Config::from_json(&config_json)
+      .map_err(|e| Error::from_mlx(MlxErrorKind::Config, e))?;
 
     // Run the FULL `Gemma3Config::validate` (it pins `model_type` and requires
     // every dimension / count — `hidden_size`, `vocab_size`, the layer / head
@@ -208,10 +209,12 @@ impl MlxModel {
     // (expensive) weight file. NO upper cap beyond `mlxrs`'s own is imposed (the
     // checkpoint author owns the model dimensions; this is a library, not
     // DoS-hardened).
-    config.validate().map_err(Error::from_mlx)?;
+    config
+      .validate()
+      .map_err(|e| Error::from_mlx(MlxErrorKind::Config, e))?;
 
     let raw = load()?;
-    let weights = sanitize(raw).map_err(Error::from_mlx)?;
+    let weights = sanitize(raw).map_err(|e| Error::from_mlx(MlxErrorKind::Load, e))?;
 
     // An MLX EmbeddingGemma checkpoint may be a QUANTIZED safetensors (an
     // `mlx-community` 8-bit export whose projections + token embedding carry
@@ -231,13 +234,13 @@ impl MlxModel {
     // parse when the file is actually present so an absent pooling config is not
     // surfaced as a load error.
     let pooling: Option<StPoolingConfig> = if dir.join("1_Pooling").join("config.json").is_file() {
-      Some(pooling_from_st_config_path(dir).map_err(Error::from_mlx)?)
+      Some(pooling_from_st_config_path(dir).map_err(|e| Error::from_mlx(MlxErrorKind::Config, e))?)
     } else {
       None
     };
 
     let model = EmbeddingGemmaModel::from_weights(config, weights, pooling.as_ref())
-      .map_err(Error::from_mlx)?;
+      .map_err(|e| Error::from_mlx(MlxErrorKind::Load, e))?;
 
     // The Gemma `<pad>` id the model's dynamic-right-pad text encoding writes
     // into pad cells — read from the model's own contract, not hard-coded.
@@ -312,13 +315,13 @@ impl MlxModel {
         mlxrs::Array::from_slice::<i32>(&input_ids, &(batch, seq_len)).map_err(|e| {
           Error::Batch {
             index: base,
-            source: Box::new(Error::from_mlx(e)),
+            source: Box::new(Error::from_mlx(MlxErrorKind::Runtime, e)),
           }
         })?;
       let attention_mask = mlxrs::Array::from_slice::<f32>(&attention_mask, &(batch, seq_len))
         .map_err(|e| Error::Batch {
           index: base,
-          source: Box::new(Error::from_mlx(e)),
+          source: Box::new(Error::from_mlx(MlxErrorKind::Runtime, e)),
         })?;
 
       let pooled = self
@@ -326,7 +329,7 @@ impl MlxModel {
         .encode_text(&input_ids, &attention_mask)
         .map_err(|e| Error::Batch {
           index: base,
-          source: Box::new(Error::from_mlx(e)),
+          source: Box::new(Error::from_mlx(MlxErrorKind::Runtime, e)),
         })?;
       for (row_idx, row) in eval_rows(&pooled, batch)
         .map_err(|e| Error::Batch {
@@ -410,7 +413,10 @@ fn build_text_batch(tokenizer: &Tokenizer, texts: &[&str], pad_token_id: u32) ->
   let batch = texts.len();
 
   let total = batch.checked_mul(seq_len).ok_or_else(|| {
-    Error::mlx_owned(format!("batch {batch} * seq_len {seq_len} overflows usize"))
+    Error::mlx_owned(
+      MlxErrorKind::Runtime,
+      format!("batch {batch} * seq_len {seq_len} overflows usize"),
+    )
   })?;
 
   let mut input_ids: Vec<i32> = Vec::new();
@@ -456,9 +462,10 @@ fn build_text_batch(tokenizer: &Tokenizer, texts: &[&str], pad_token_id: u32) ->
 /// with a typed [`Error::Mlx`] naming the offending id.
 fn checked_id(id: u32) -> Result<i32> {
   i32::try_from(id).map_err(|_| {
-    Error::mlx_owned(format!(
-      "tokenizer id {id} exceeds i32::MAX for MLX input_ids"
-    ))
+    Error::mlx_owned(
+      MlxErrorKind::Runtime,
+      format!("tokenizer id {id} exceeds i32::MAX for MLX input_ids"),
+    )
   })
 }
 
@@ -469,19 +476,23 @@ fn checked_id(id: u32) -> Result<i32> {
 fn eval_rows(arr: &mlxrs::Array, rows: usize) -> Result<Vec<Vec<f32>>> {
   let shape = arr.shape();
   if shape.len() != 2 {
-    return Err(Error::mlx_owned(format!(
-      "expected a rank-2 (rows, dim) embedding tensor, got shape {shape:?}"
-    )));
+    return Err(Error::mlx_owned(
+      MlxErrorKind::Runtime,
+      format!("expected a rank-2 (rows, dim) embedding tensor, got shape {shape:?}"),
+    ));
   }
   if shape[0] != rows {
-    return Err(Error::mlx_owned(format!(
-      "expected {rows} embedding rows, got {}",
-      shape[0]
-    )));
+    return Err(Error::mlx_owned(
+      MlxErrorKind::Runtime,
+      format!("expected {rows} embedding rows, got {}", shape[0]),
+    ));
   }
   let dim = shape[1];
   if dim == 0 {
-    return Err(Error::mlx("embedding tensor has a zero-width dimension"));
+    return Err(Error::mlx(
+      MlxErrorKind::Runtime,
+      "embedding tensor has a zero-width dimension",
+    ));
   }
   // Cast to f32 before the host copy: a half-precision (f16/bf16) or quantized
   // MLX checkpoint yields an embedding in its activation dtype (the tower
@@ -489,9 +500,15 @@ fn eval_rows(arr: &mlxrs::Array, rows: usize) -> Result<Vec<Vec<f32>>> {
   // `astype` is a no-op for an already-f32 embedding and produces a NEW array,
   // so the model's tensors are never mutated (the property the prior
   // `try_clone` had).
-  let mut owned = arr.astype(mlxrs::Dtype::F32).map_err(Error::from_mlx)?;
-  owned.eval().map_err(Error::from_mlx)?;
-  let flat = owned.to_vec::<f32>().map_err(Error::from_mlx)?;
+  let mut owned = arr
+    .astype(mlxrs::Dtype::F32)
+    .map_err(|e| Error::from_mlx(MlxErrorKind::Runtime, e))?;
+  owned
+    .eval()
+    .map_err(|e| Error::from_mlx(MlxErrorKind::Runtime, e))?;
+  let flat = owned
+    .to_vec::<f32>()
+    .map_err(|e| Error::from_mlx(MlxErrorKind::Runtime, e))?;
   Ok(flat.chunks_exact(dim).map(<[f32]>::to_vec).collect())
 }
 
@@ -508,6 +525,7 @@ fn embedding_from_row(row: Vec<f32>) -> Result<Embedding> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::error::MlxErrorKind;
 
   /// A weight map whose key set mirrors a DENSE checkpoint (only `.weight`
   /// siblings, no `.scales`) is classified dense. Pins the dense side of the
@@ -558,11 +576,14 @@ mod tests {
     assert_eq!(checked_id(i32::MAX as u32).expect("in range"), i32::MAX);
     let bad = (i32::MAX as u32) + 1;
     match checked_id(bad) {
-      Err(Error::Mlx(msg)) => assert!(
-        msg.contains(&bad.to_string()),
-        "error must name the offending id {bad}, got {msg:?}"
+      Err(Error::Mlx {
+        kind: MlxErrorKind::Runtime,
+        message,
+      }) => assert!(
+        message.contains(&bad.to_string()),
+        "error must name the offending id {bad}, got {message:?}"
       ),
-      other => panic!("expected Error::Mlx naming the id, got {other:?}"),
+      other => panic!("expected Error::Mlx{{Runtime}} naming the id, got {other:?}"),
     }
   }
 
@@ -591,11 +612,18 @@ mod tests {
       .err()
       .expect("a zero hidden_size must be rejected at construction");
     match err {
-      Error::Mlx(msg) => assert!(
-        msg.contains("hidden_size"),
-        "expected an Error::Mlx naming hidden_size, got {msg:?}"
-      ),
-      other => panic!("expected Error::Mlx for a zero hidden_size, got {other}"),
+      Error::Mlx { kind, message } => {
+        assert_eq!(
+          kind,
+          MlxErrorKind::Config,
+          "config failure must be tagged Config"
+        );
+        assert!(
+          message.contains("hidden_size"),
+          "expected message naming hidden_size, got {message:?}"
+        );
+      }
+      other => panic!("expected Error::Mlx{{Config}}, got {other}"),
     }
   }
 
@@ -629,8 +657,14 @@ mod tests {
       .err()
       .expect("an invalid model_type must be rejected at construction");
     assert!(
-      matches!(err, Error::Mlx(_)),
-      "expected Error::Mlx for an invalid config, got {err}"
+      matches!(
+        err,
+        Error::Mlx {
+          kind: MlxErrorKind::Config,
+          ..
+        }
+      ),
+      "expected Error::Mlx{{Config}} for an invalid config, got {err}"
     );
   }
 

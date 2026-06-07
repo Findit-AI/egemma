@@ -118,7 +118,12 @@ pub(crate) enum Routed {
 /// forces ONNX; `Mlx` forces MLX and errors with
 /// [`crate::Error::BackendUnavailable`] when the directory holds no MLX
 /// checkpoint.
-#[cfg(all(feature = "inference", not(target_arch = "wasm32"), target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(
+  feature = "inference",
+  not(target_arch = "wasm32"),
+  target_os = "macos",
+  target_arch = "aarch64"
+))]
 pub(crate) fn route(
   dir: &std::path::Path,
   backend: crate::options::Backend,

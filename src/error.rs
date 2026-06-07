@@ -4,6 +4,21 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// Which phase of the MLX backend produced an [`Error::Mlx`]: reading/validating
+/// the checkpoint config, loading weights, or the inference forward pass. Lets
+/// callers branch (e.g. retry `Runtime`, fail-fast `Config`) even though the
+/// underlying `mlxrs::Error` text is opaque.
+#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlxErrorKind {
+  /// Config read / parse / `Gemma3Config::validate`.
+  Config,
+  /// Weight load / `sanitize` / `from_weights` / pooling-config read.
+  Load,
+  /// Inference: tensor build, `encode_text`, eval, or output-shape extraction.
+  Runtime,
+}
+
 /// All errors surfaced from the public API.
 ///
 /// `#[non_exhaustive]` so that adding variants in a future minor
@@ -176,11 +191,13 @@ pub enum Error {
   /// exists). The `mlxrs::Error` is captured as its `Display` string so this
   /// crate's public `Error` does not leak the `mlxrs` type into its API.
   #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
-  #[error("mlx backend error: {0}")]
-  Mlx(
+  #[error("mlx backend {kind:?} error: {message}")]
+  Mlx {
+    /// Which phase of the backend failed.
+    kind: MlxErrorKind,
     /// Human-readable description of the MLX backend failure.
-    String,
-  ),
+    message: String,
+  },
 
   /// `Vec::try_reserve_exact` returned an error — the global allocator could
   /// not satisfy a text-batch scratch request on the MLX path. Surfaced as a
@@ -206,18 +223,27 @@ pub enum Error {
 #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
 impl Error {
   /// Build an [`Error::Mlx`] from a static reason string.
-  pub(crate) fn mlx(reason: &'static str) -> Self {
-    Error::Mlx(reason.to_string())
+  pub(crate) fn mlx(kind: MlxErrorKind, reason: &'static str) -> Self {
+    Error::Mlx {
+      kind,
+      message: reason.to_string(),
+    }
   }
 
   /// Build an [`Error::Mlx`] from an owned reason string.
-  pub(crate) fn mlx_owned(reason: String) -> Self {
-    Error::Mlx(reason)
+  pub(crate) fn mlx_owned(kind: MlxErrorKind, reason: String) -> Self {
+    Error::Mlx {
+      kind,
+      message: reason,
+    }
   }
 
   /// Convert an `mlxrs::Error` into [`Error::Mlx`], capturing its `Display`.
-  pub(crate) fn from_mlx(source: mlxrs::Error) -> Self {
-    Error::Mlx(source.to_string())
+  pub(crate) fn from_mlx(kind: MlxErrorKind, source: mlxrs::Error) -> Self {
+    Error::Mlx {
+      kind,
+      message: source.to_string(),
+    }
   }
 }
 
@@ -266,5 +292,15 @@ mod tests {
     let msg = e.to_string();
     assert!(msg.contains("Mlx"), "got {msg:?}");
     assert!(msg.contains("not apple silicon"), "got {msg:?}");
+  }
+
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[test]
+  fn mlx_error_displays_kind_and_message() {
+    let e = Error::Mlx {
+      kind: MlxErrorKind::Runtime,
+      message: "boom".to_string(),
+    };
+    assert_eq!(e.to_string(), "mlx backend Runtime error: boom");
   }
 }
