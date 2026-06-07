@@ -37,6 +37,13 @@ pub use error::{Error, Result};
 pub use options::GraphOptimizationLevel;
 pub use options::{Backend, BatchOptions, Options, ThreadOptions};
 
+#[cfg(feature = "windowing")]
+#[cfg_attr(docsrs, doc(cfg(feature = "windowing")))]
+pub mod window;
+#[cfg(feature = "windowing")]
+#[cfg_attr(docsrs, doc(cfg(feature = "windowing")))]
+pub use window::{WindowEmbedding, WindowOptions, WindowStrategy};
+
 #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
 pub use error::MlxErrorKind;

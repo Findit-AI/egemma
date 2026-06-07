@@ -28,6 +28,10 @@ include = [
 # enum — useful in environments where inference happens elsewhere.
 ort        = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.23", optional = true }
+# Optional: powers the `windowing` feature's Semantic chunker. Uses the same
+# `tokenizers` version as our direct dep (verified to unify at 0.23). Pulls a
+# heavy ICU/Unicode-segmentation tree, hence opt-in.
+text-splitter = { version = "0.31", features = ["tokenizers"], optional = true }
 thiserror  = "2"
 # `serde` is opt-in: most consumers use `egemma` purely as an inference
 # library and don't need to (de)serialize `Options`. Pulling serde
@@ -106,6 +110,10 @@ inference = ["dep:ort", "dep:tokenizers"]
 # slice (see `Embedding` docs) so the dim and L2-norm invariants that
 # `TryFrom<Vec<f32>>` exists to enforce can't be bypassed.
 serde     = ["dep:serde"]
+# Long-input sliding-window support (`TextEncoder::embed_windows` / `embed_pooled`).
+# Off by default — pulls `text-splitter` + its ICU dependency tree. Implies
+# `inference` (it windows around the inference text path).
+windowing = ["dep:text-splitter", "inference"]
 # NOTE: there is intentionally no `mlx` feature. The MLX (`mlxrs`) Metal
 # backend is selected automatically by platform — see the `mlxrs` target
 # dependency above and the `from_dir` auto-routing in `src/text_enc.rs`. On
@@ -157,7 +165,7 @@ rpath             = false
 # the docs build even when the actual code on docs.rs is fine. List
 # the features that compile on a stock Linux runner; EP-specific docs
 # coverage would need a separately provisioned builder.
-features = ["inference", "serde"]
+features = ["inference", "serde", "windowing"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
