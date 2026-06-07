@@ -35,7 +35,11 @@ pub use error::{Error, Result};
 #[cfg(feature = "inference")]
 #[cfg_attr(docsrs, doc(cfg(feature = "inference")))]
 pub use options::GraphOptimizationLevel;
-pub use options::{BatchOptions, Options, ThreadOptions};
+pub use options::{Backend, BatchOptions, Options, ThreadOptions};
+
+#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
+pub use error::MlxErrorKind;
 #[cfg(feature = "inference")]
 #[cfg_attr(docsrs, doc(cfg(feature = "inference")))]
 pub use text_enc::TextEncoder;
