@@ -63,6 +63,7 @@ use tokenizers::Tokenizer;
 use crate::{
   embedding::Embedding,
   error::{Error, MlxErrorKind, Result},
+  options::BatchOptions,
 };
 
 /// The standard config file name inside an MLX checkpoint directory.
@@ -119,18 +120,15 @@ pub(crate) struct MlxModel {
   /// does not hard-code a pad id ungrounded in `mlxrs`'s contract.
   pad_token_id: u32,
   /// Hard cap on a single batch's length, mirroring the ORT path's
-  /// [`crate::BatchOptions::max_batch_size`]. The `from_mlx_dir` constructor
-  /// takes no [`crate::Options`], so this is the crate-default cap
-  /// ([`BatchOptions::default`](crate::BatchOptions)'s `1024`); the text batch
-  /// path rejects oversized batches with [`Error::BatchTooLarge`] BEFORE
-  /// allocating, exactly as the ORT path does.
+  /// [`crate::BatchOptions::max_batch_size`]. The text batch path rejects
+  /// oversized batches with [`Error::BatchTooLarge`] BEFORE allocating, exactly
+  /// as the ORT path does.
   max_batch_size: usize,
   /// Micro-batch chunk size for the text path, mirroring the ORT path's
   /// [`crate::BatchOptions::batch_size`]. `embed_text_batch` splits a request
-  /// into chunks of this many rows and runs one `encode_text` forward per
-  /// chunk (each dynamically right-padded to its own max length), so a within-
-  /// cap batch never materializes as a single oversized MLX/Metal graph. The
-  /// constructor takes no [`crate::Options`], so this is the crate-default.
+  /// into chunks of this many rows and runs one `encode_text` forward per chunk
+  /// (each dynamically right-padded to its own max length), so a within-cap
+  /// batch never materializes as a single oversized MLX/Metal graph.
   batch_size: usize,
 }
 
@@ -144,8 +142,8 @@ impl MlxModel {
   /// `model.safetensors`, a `*.gguf`, or a `*.npz` via the centralized `mlxrs`
   /// loader. For an exact known weight file path use [`Self::from_safetensors`]
   /// (or the feature-gated `from_npz` / `from_gguf`).
-  pub(crate) fn from_dir(dir: &Path) -> Result<Self> {
-    Self::construct(dir, || {
+  pub(crate) fn from_dir(dir: &Path, batch: BatchOptions) -> Result<Self> {
+    Self::construct(dir, batch, || {
       mlxrs::io::load_weights_from_dir(dir).map_err(|e| Error::from_mlx(MlxErrorKind::Load, e))
     })
   }
@@ -153,8 +151,8 @@ impl MlxModel {
   /// Load a model from an **exact** `model.safetensors` file path. The
   /// `config.json` (and optional `1_Pooling/config.json`) are read from the
   /// weight file's parent directory (see [`weights_parent`]).
-  pub(crate) fn from_safetensors(weights: &Path) -> Result<Self> {
-    Self::construct(weights_parent(weights), || {
+  pub(crate) fn from_safetensors(weights: &Path, batch: BatchOptions) -> Result<Self> {
+    Self::construct(weights_parent(weights), batch, || {
       mlxrs::io::load_safetensors(weights).map_err(|e| Error::from_mlx(MlxErrorKind::Load, e))
     })
   }
@@ -163,8 +161,8 @@ impl MlxModel {
   /// optional `1_Pooling/config.json`) are read from the weight file's parent
   /// directory (see [`weights_parent`]).
   #[cfg(feature = "npz")]
-  pub(crate) fn from_npz(weights: &Path) -> Result<Self> {
-    Self::construct(weights_parent(weights), || {
+  pub(crate) fn from_npz(weights: &Path, batch: BatchOptions) -> Result<Self> {
+    Self::construct(weights_parent(weights), batch, || {
       mlxrs::io::load_npz(weights).map_err(|e| Error::from_mlx(MlxErrorKind::Load, e))
     })
   }
@@ -174,8 +172,8 @@ impl MlxModel {
   /// directory (see [`weights_parent`]); the gguf's embedded metadata is NOT
   /// mapped to a config, so a sibling `config.json` is still required.
   #[cfg(feature = "gguf")]
-  pub(crate) fn from_gguf(weights: &Path) -> Result<Self> {
-    Self::construct(weights_parent(weights), || {
+  pub(crate) fn from_gguf(weights: &Path, batch: BatchOptions) -> Result<Self> {
+    Self::construct(weights_parent(weights), batch, || {
       mlxrs::io::load_gguf(weights)
         .map(|(w, _meta)| w)
         .map_err(|e| Error::from_mlx(MlxErrorKind::Load, e))
@@ -193,8 +191,14 @@ impl MlxModel {
   /// `load`, so a malformed config fails fast and never touches the weight file.
   fn construct(
     dir: &Path,
+    batch: BatchOptions,
     load: impl FnOnce() -> Result<HashMap<String, mlxrs::Array>>,
   ) -> Result<Self> {
+    // Validate batch options FIRST — cheap, file-free, and symmetric with the
+    // ORT path (see `from_ort_session_with_options`). An invalid batch never
+    // touches the (expensive) weight file.
+    batch.validate()?;
+
     let config_path = dir.join(CONFIG_FILE);
 
     let config_json = std::fs::read_to_string(&config_path)?;
@@ -249,16 +253,13 @@ impl MlxModel {
     Ok(Self {
       model: Rc::new(model),
       pad_token_id,
-      // The MLX constructor takes no `Options`, so adopt the crate-default
-      // `max_batch_size` cap and `batch_size` micro-batch the ORT path uses by
-      // default — same contract.
-      max_batch_size: crate::options::BatchOptions::default().max_batch_size(),
-      batch_size: crate::options::BatchOptions::default().batch_size(),
+      max_batch_size: batch.max_batch_size(),
+      batch_size: batch.batch_size(),
     })
   }
 
-  /// The hard per-batch cap this model adopted at construction (the crate-
-  /// default `max_batch_size`). Read by [`crate::text_enc::TextEncoder::embed_batch`]
+  /// The hard per-batch cap this model adopted at construction from the supplied
+  /// [`crate::BatchOptions`]. Read by [`crate::text_enc::TextEncoder::embed_batch`]
   /// so the outer max-batch guard can reject an oversized batch before the
   /// per-item empty scan, symmetric with the ORT path.
   pub(crate) fn max_batch_size(&self) -> usize {
@@ -525,7 +526,7 @@ fn embedding_from_row(row: Vec<f32>) -> Result<Embedding> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::error::MlxErrorKind;
+  use crate::{error::MlxErrorKind, options::BatchOptions};
 
   /// A weight map whose key set mirrors a DENSE checkpoint (only `.weight`
   /// siblings, no `.scales`) is classified dense. Pins the dense side of the
@@ -604,7 +605,7 @@ mod tests {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp config dir");
     std::fs::write(dir.join(CONFIG_FILE), br#"{"hidden_size": 0}"#).expect("write config.json");
-    let result = MlxModel::from_dir(&dir);
+    let result = MlxModel::from_dir(&dir, BatchOptions::default());
     let _ = std::fs::remove_dir_all(&dir);
     // `MlxModel` is not `Debug` (it holds an `Rc`-backed device model), so use
     // `.err().expect(...)` rather than formatting the whole `Result`.
@@ -651,7 +652,7 @@ mod tests {
       br#"{"model_type": "not_gemma3", "hidden_size": 768}"#,
     )
     .expect("write config.json");
-    let result = MlxModel::from_dir(&dir);
+    let result = MlxModel::from_dir(&dir, BatchOptions::default());
     let _ = std::fs::remove_dir_all(&dir);
     let err = result
       .err()

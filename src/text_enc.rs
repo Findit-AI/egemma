@@ -54,7 +54,7 @@ impl TextBackend {
   /// [`TextEncoder::embed_batch`] to reject an oversized batch (with
   /// [`Error::BatchTooLarge`]) before the per-item empty scan and before
   /// dispatch — the ONNX path reads it off [`Options::batch`]'s
-  /// `max_batch_size`; the MLX path off the model's adopted crate-default cap.
+  /// `max_batch_size`; the MLX path off the cap the model stored at construction.
   fn max_batch_size(&self) -> usize {
     match self {
       TextBackend::Ort(ort) => ort.opts.batch().max_batch_size(),
@@ -174,16 +174,10 @@ impl TextEncoder {
     )
   }
 
-  // Temporary shim: ignores `opts` and builds the MLX backend with crate
-  // defaults. The real `Options`-honoring body lands in Task 5.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-  pub(crate) fn from_mlx_dir_with_options(dir: &Path, _opts: Options) -> Result<Self> {
-    Self::from_mlx_dir(dir)
-  }
-
-  /// MLX dispatch target for [`Self::from_dir`]: load from an **MLX checkpoint
-  /// directory** (`config.json` + `model.safetensors` + `tokenizer.json`, and
-  /// optionally `1_Pooling/config.json`) using the `mlxrs` Metal backend.
+  /// MLX dispatch target for [`Self::from_dir_with_options`]: load from an **MLX
+  /// checkpoint directory** (`config.json` + `model.safetensors` +
+  /// `tokenizer.json`, and optionally `1_Pooling/config.json`) using the `mlxrs`
+  /// Metal backend, honoring the provided [`Options`].
   ///
   /// Crate-internal — the user's directory entry point is [`Self::from_dir`],
   /// which auto-routes here on Apple Silicon when an MLX checkpoint is present.
@@ -193,8 +187,8 @@ impl TextEncoder {
   /// and the dynamic-right-pad to the batch maximum is built manually under
   /// `mlxrs`'s EmbeddingGemma contract.
   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-  pub(crate) fn from_mlx_dir(dir: &Path) -> Result<Self> {
-    let model = crate::mlx::MlxModel::from_dir(dir)?;
+  pub(crate) fn from_mlx_dir_with_options(dir: &Path, opts: Options) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_dir(dir, opts.batch())?;
     let tokenizer = prepare_mlx_tokenizer(&dir.join("tokenizer.json"))?;
     Ok(Self {
       backend: TextBackend::Mlx { model, tokenizer },
@@ -210,9 +204,19 @@ impl TextEncoder {
   /// [`Self::from_dir`]: use it when you already know the checkpoint is an MLX
   /// safetensors file and where it lives. There is no ONNX fallback — this
   /// constructor always builds the MLX backend.
+  ///
+  /// Equivalent to `from_safetensors_with_options(weights, Options::default())`.
   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
   pub fn from_safetensors(weights: &Path) -> Result<Self> {
-    let model = crate::mlx::MlxModel::from_safetensors(weights)?;
+    Self::from_safetensors_with_options(weights, Options::default())
+  }
+
+  /// Like [`Self::from_safetensors`] but with explicit [`Options`], including the
+  /// [`BatchOptions`](crate::options::BatchOptions) for batch-size and
+  /// sequence-length policy. Batch validation runs before any file I/O.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub fn from_safetensors_with_options(weights: &Path, opts: Options) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_safetensors(weights, opts.batch())?;
     let tokenizer =
       prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
     Ok(Self {
@@ -226,9 +230,19 @@ impl TextEncoder {
   ///
   /// Explicit-format MLX constructor (see [`Self::from_safetensors`]); always
   /// builds the MLX backend, no ONNX fallback.
+  ///
+  /// Equivalent to `from_npz_with_options(weights, Options::default())`.
   #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz"))]
   pub fn from_npz(weights: &Path) -> Result<Self> {
-    let model = crate::mlx::MlxModel::from_npz(weights)?;
+    Self::from_npz_with_options(weights, Options::default())
+  }
+
+  /// Like [`Self::from_npz`] but with explicit [`Options`], including the
+  /// [`BatchOptions`](crate::options::BatchOptions) for batch-size and
+  /// sequence-length policy. Batch validation runs before any file I/O.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz"))]
+  pub fn from_npz_with_options(weights: &Path, opts: Options) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_npz(weights, opts.batch())?;
     let tokenizer =
       prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
     Ok(Self {
@@ -244,9 +258,19 @@ impl TextEncoder {
   ///
   /// Explicit-format MLX constructor (see [`Self::from_safetensors`]); always
   /// builds the MLX backend, no ONNX fallback.
+  ///
+  /// Equivalent to `from_gguf_with_options(weights, Options::default())`.
   #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf"))]
   pub fn from_gguf(weights: &Path) -> Result<Self> {
-    let model = crate::mlx::MlxModel::from_gguf(weights)?;
+    Self::from_gguf_with_options(weights, Options::default())
+  }
+
+  /// Like [`Self::from_gguf`] but with explicit [`Options`], including the
+  /// [`BatchOptions`](crate::options::BatchOptions) for batch-size and
+  /// sequence-length policy. Batch validation runs before any file I/O.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf"))]
+  pub fn from_gguf_with_options(weights: &Path, opts: Options) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_gguf(weights, opts.batch())?;
     let tokenizer =
       prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
     Ok(Self {
@@ -657,6 +681,25 @@ pub(crate) fn prepare_mlx_tokenizer(tokenizer_json: &Path) -> Result<Tokenizer> 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[test]
+  fn mlx_with_options_rejects_invalid_batch_before_loading() {
+    use crate::options::{BatchOptions, Options};
+    // batch_size = 0 is invalid; validation must fire BEFORE touching the
+    // (nonexistent) weight file, so we get InvalidBatchSize, not an IO error.
+    let opts = Options::default().with_batch(BatchOptions::default().with_batch_size(0));
+    let err = TextEncoder::from_safetensors_with_options(
+      std::path::Path::new("/nonexistent/model.safetensors"),
+      opts,
+    )
+    .err()
+    .expect("invalid batch_size must be rejected");
+    assert!(
+      matches!(err, Error::InvalidBatchSize { batch_size: 0, .. }),
+      "expected InvalidBatchSize, got {err}"
+    );
+  }
 
   #[test]
   fn pad_token_constant_matches_gemma_vocab() {
