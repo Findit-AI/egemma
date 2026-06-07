@@ -30,30 +30,47 @@ const DEFAULT_MAX_SEQ_LEN: usize = 2048;
 /// `embedding-gemma` text-tower inference.
 ///
 /// Holds either an ONNX Runtime session + tokenizer (the `ort` backend) or — on
-/// Apple Silicon, when [`Self::from_dir`] auto-routes to it — an `mlxrs` MLX
-/// model + tokenizer (the MLX backend), behind one public API. Both return an
-/// L2-normalized [`Embedding`] (768-dim for the base export).
+/// Apple Silicon with the `mlx` feature, when [`Self::from_dir`] auto-routes to
+/// it — an `mlxrs` MLX model + tokenizer (the MLX backend), behind one public
+/// API. Both return an L2-normalized [`Embedding`] (768-dim for the base export).
 ///
-/// Auto-trait reality is platform-conditional:
-/// - On every target **except** `aarch64-apple-darwin`: `Send + !Sync`. Only the
-///   `ort` backend is compiled; `ort::Session` is `Send` but `!Sync`.
-/// - On `aarch64-apple-darwin`: `!Send + !Sync`. The MLX backend variant is
-///   compiled in unconditionally (whenever `inference` is on), and it holds an
-///   `Rc`-backed MLX model whose device handles are not `Send` — so the enum is
-///   `!Send` for *every* `TextEncoder` on this target, including `ort`-backed
-///   ones (an enum is `Send` only if all its variants are).
+/// Auto-trait reality:
+/// - **By default** — the MLX backend is not compiled (the `mlx` feature is off,
+///   or any non-Apple-Silicon target): `Send + !Sync`. Only the `ort` backend is
+///   compiled; `ort::Session` is `Send` but `!Sync`.
+/// - **With the `mlx` feature on `aarch64-apple-darwin`**: `!Send + !Sync`. The
+///   MLX backend variant is compiled in, and it holds an `Rc`-backed MLX model
+///   whose device handles are not `Send` — so the enum is `!Send` for *every*
+///   `TextEncoder` on that build, including `ort`-backed ones (an enum is `Send`
+///   only if all its variants are). Leave `mlx` off for a `Send` ONNX encoder on
+///   Apple Silicon.
 ///
 /// Either way the type is `!Sync`. Workers wanting parallelism instantiate one
-/// `TextEncoder` per thread; off Apple Silicon they may alternatively share one
-/// behind a `Mutex<TextEncoder>`.
+/// `TextEncoder` per thread; when the type is `Send` they may alternatively share
+/// one behind a `Mutex<TextEncoder>`.
 pub struct TextEncoder {
   backend: TextBackend,
 }
 
+// Compile-time guard for the auto-trait contract documented above: when the MLX
+// backend is NOT compiled (the `mlx` feature is off, or any non-Apple-Silicon
+// target), the public `TextEncoder` MUST stay `Send` so consumers can move an
+// `ort`-backed encoder across threads (a thread pool, `tokio::task`, etc.).
+// Portable code that compiles on, say, Linux must also compile on a default
+// Apple-Silicon build. The opt-in `mlx` feature deliberately relaxes this on
+// Apple Silicon (the MLX model is `Rc`-backed); it must not regress anywhere the
+// MLX backend is absent. If a future change makes the ONNX path `!Send`, this
+// fails to compile instead of silently breaking downstreams.
+#[cfg(not(all(feature = "mlx", target_os = "macos", target_arch = "aarch64")))]
+const _: fn() = || {
+  fn assert_send<T: Send>() {}
+  assert_send::<TextEncoder>();
+};
+
 /// The inference backend behind a [`TextEncoder`].
 enum TextBackend {
   Ort(OrtTextEncoder),
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   Mlx {
     model: crate::mlx::MlxModel,
     tokenizer: Tokenizer,
@@ -69,7 +86,7 @@ impl TextBackend {
   fn max_batch_size(&self) -> usize {
     match self {
       TextBackend::Ort(ort) => ort.opts.batch().max_batch_size(),
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
       TextBackend::Mlx { model, .. } => model.max_batch_size(),
     }
   }
@@ -139,13 +156,13 @@ impl TextEncoder {
   /// the best backend for the platform. This entry point auto-routes; use
   /// [`Self::from_dir_with_options`] to force a specific [`crate::options::Backend`].
   ///
-  /// On Apple Silicon (`aarch64-apple-darwin`) the directory is probed and
-  /// routes to the `mlxrs` **MLX** Metal backend when the text ONNX graph this
-  /// constructor needs (`model.onnx`) is absent and an MLX checkpoint
-  /// (`config.json` + `model.safetensors`) is present; otherwise the **ONNX**
-  /// graph + the directory's `tokenizer.json` are loaded via ONNX Runtime. On
-  /// every other platform only the ONNX backend is compiled, so that path is
-  /// taken unconditionally.
+  /// On Apple Silicon (`aarch64-apple-darwin`) **with the `mlx` feature** the
+  /// directory is probed and routes to the `mlxrs` **MLX** Metal backend when the
+  /// text ONNX graph this constructor needs (`model.onnx`) is absent and an MLX
+  /// checkpoint (`config.json` + `model.safetensors`) is present; otherwise the
+  /// **ONNX** graph + the directory's `tokenizer.json` are loaded via ONNX
+  /// Runtime. Without the `mlx` feature (or on any other platform) only the ONNX
+  /// backend is compiled, so that path is taken unconditionally.
   ///
   /// **Not available on wasm32** (the ONNX session constructors are gated out —
   /// see [`Self::from_files`]).
@@ -161,15 +178,12 @@ impl TextEncoder {
     use crate::backend_select::{Routed, TEXT_ONNX, route};
     match route(dir, opts.backend(), &[TEXT_ONNX])? {
       Routed::Onnx => Self::from_onnx_dir_with_options(dir, opts),
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      // `Routed::Mlx` only exists when the MLX backend is compiled (the `mlx`
+      // feature on Apple Silicon). Without it, `route` returns
+      // `Error::BackendUnavailable` for a forced `Backend::Mlx` before we get
+      // here and `Routed` has no `Mlx` variant, so this match stays total.
+      #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
       Routed::Mlx => Self::from_mlx_dir_with_options(dir, opts),
-      // `route` never returns `Mlx` off Apple Silicon; keep the match total
-      // without a panic.
-      #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-      Routed::Mlx => Err(Error::BackendUnavailable {
-        requested: crate::options::Backend::Mlx,
-        reason: "the MLX backend is only available on aarch64-apple-darwin".to_string(),
-      }),
     }
   }
 
@@ -191,7 +205,8 @@ impl TextEncoder {
   /// Metal backend, honoring the provided [`Options`].
   ///
   /// Crate-internal — the user's directory entry point is [`Self::from_dir`],
-  /// which auto-routes here on Apple Silicon when an MLX checkpoint is present.
+  /// which auto-routes here on Apple Silicon (with the `mlx` feature) when an MLX
+  /// checkpoint is present.
   /// The tokenizer is loaded from `tokenizer.json` in the same directory via
   /// `prepare_mlx_tokenizer`: built-in **padding** is disabled (the dynamic
   /// right-pad to the batch maximum is built manually under `mlxrs`'s
@@ -199,7 +214,7 @@ impl TextEncoder {
   /// longer than `opts.batch().max_seq_len()` are clipped before the forward
   /// pass. The Phase C windowing path bypasses truncation by operating on the
   /// full text.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   pub(crate) fn from_mlx_dir_with_options(dir: &Path, opts: Options) -> Result<Self> {
     let model = crate::mlx::MlxModel::from_dir(dir, opts.batch())?;
     let tokenizer = prepare_mlx_tokenizer(&dir.join("tokenizer.json"), opts.batch().max_seq_len())?;
@@ -219,7 +234,7 @@ impl TextEncoder {
   /// constructor always builds the MLX backend.
   ///
   /// Equivalent to `from_safetensors_with_options(weights, Options::default())`.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   pub fn from_safetensors(weights: &Path) -> Result<Self> {
     Self::from_safetensors_with_options(weights, Options::default())
   }
@@ -227,7 +242,7 @@ impl TextEncoder {
   /// Like [`Self::from_safetensors`] but with explicit [`Options`], including the
   /// [`BatchOptions`](crate::options::BatchOptions) for batch-size and
   /// sequence-length policy. Batch validation runs before any file I/O.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   pub fn from_safetensors_with_options(weights: &Path, opts: Options) -> Result<Self> {
     let model = crate::mlx::MlxModel::from_safetensors(weights, opts.batch())?;
     let tokenizer = prepare_mlx_tokenizer(
@@ -247,7 +262,12 @@ impl TextEncoder {
   /// builds the MLX backend, no ONNX fallback.
   ///
   /// Equivalent to `from_npz_with_options(weights, Options::default())`.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz"))]
+  #[cfg(all(
+    feature = "mlx",
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "npz"
+  ))]
   pub fn from_npz(weights: &Path) -> Result<Self> {
     Self::from_npz_with_options(weights, Options::default())
   }
@@ -255,7 +275,12 @@ impl TextEncoder {
   /// Like [`Self::from_npz`] but with explicit [`Options`], including the
   /// [`BatchOptions`](crate::options::BatchOptions) for batch-size and
   /// sequence-length policy. Batch validation runs before any file I/O.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz"))]
+  #[cfg(all(
+    feature = "mlx",
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "npz"
+  ))]
   pub fn from_npz_with_options(weights: &Path, opts: Options) -> Result<Self> {
     let model = crate::mlx::MlxModel::from_npz(weights, opts.batch())?;
     let tokenizer = prepare_mlx_tokenizer(
@@ -277,7 +302,12 @@ impl TextEncoder {
   /// builds the MLX backend, no ONNX fallback.
   ///
   /// Equivalent to `from_gguf_with_options(weights, Options::default())`.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf"))]
+  #[cfg(all(
+    feature = "mlx",
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "gguf"
+  ))]
   pub fn from_gguf(weights: &Path) -> Result<Self> {
     Self::from_gguf_with_options(weights, Options::default())
   }
@@ -285,7 +315,12 @@ impl TextEncoder {
   /// Like [`Self::from_gguf`] but with explicit [`Options`], including the
   /// [`BatchOptions`](crate::options::BatchOptions) for batch-size and
   /// sequence-length policy. Batch validation runs before any file I/O.
-  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf"))]
+  #[cfg(all(
+    feature = "mlx",
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "gguf"
+  ))]
   pub fn from_gguf_with_options(weights: &Path, opts: Options) -> Result<Self> {
     let model = crate::mlx::MlxModel::from_gguf(weights, opts.batch())?;
     let tokenizer = prepare_mlx_tokenizer(
@@ -357,8 +392,36 @@ impl TextEncoder {
     }
     match &mut self.backend {
       TextBackend::Ort(ort) => ort.embed_batch(texts),
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
       TextBackend::Mlx { model, tokenizer } => model.embed_text_batch(tokenizer, texts),
+    }
+  }
+
+  /// Embed a batch of **pre-tokenized id rows**, dispatching to the active
+  /// backend's verbatim-id path. The windowing FixedToken strategy uses this so a
+  /// window embeds the original encoding's token IDs exactly — no re-tokenization,
+  /// hence no silent truncation and no coverage gap.
+  ///
+  /// Mirrors [`Self::embed_batch`]'s outer guards: an empty slice returns
+  /// `Ok(vec![])` with no backend call; `rows.len() > max_batch_size` returns
+  /// [`Error::BatchTooLarge`]. Per-chunk / per-row failures surface as
+  /// [`Error::Batch`] with the offending input index, as with `embed_batch`.
+  #[cfg(feature = "windowing")]
+  pub(crate) fn embed_id_rows(&mut self, rows: &[Vec<u32>]) -> Result<Vec<Embedding>> {
+    if rows.is_empty() {
+      return Ok(Vec::new());
+    }
+    let max = self.backend.max_batch_size();
+    if rows.len() > max {
+      return Err(Error::BatchTooLarge {
+        got: rows.len(),
+        max,
+      });
+    }
+    match &mut self.backend {
+      TextBackend::Ort(ort) => ort.embed_id_rows(rows),
+      #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+      TextBackend::Mlx { model, .. } => model.embed_id_batch(rows),
     }
   }
 
@@ -371,23 +434,19 @@ impl TextEncoder {
     Ok(())
   }
 
-  /// Return a non-truncating tokenizer clone, the encoder's `max_seq_len`, and
-  /// the number of special tokens the post-processor adds per single sequence.
+  /// Return a non-truncating tokenizer clone and the encoder's `max_seq_len`.
   ///
   /// Both backends configure their tokenizers with truncation enabled (the ORT
   /// path via [`configure_tokenizer`], the MLX path via
-  /// [`configure_mlx_tokenizer`]). This helper clones the tokenizer, reads
-  /// `max_seq_len` off the truncation params before clearing them, and queries
-  /// the post-processor for the special-token overhead. The windowing path uses
-  /// the non-truncating clone to split the full text; `max_seq_len` and
-  /// `special_reserve` size the per-window budget so each re-embedded chunk
-  /// stays within `max_seq_len`.
+  /// [`configure_mlx_tokenizer`]). This helper clones the tokenizer and reads
+  /// `max_seq_len` off the truncation params before clearing them. The windowing
+  /// path uses the non-truncating clone to encode the full text; `max_seq_len`
+  /// bounds the per-window budget so each window stays within the model window.
   #[cfg(feature = "windowing")]
-  fn split_tokenizer(&self) -> (Tokenizer, usize, usize) {
-    use tokenizers::PostProcessor as _;
+  fn split_tokenizer(&self) -> (Tokenizer, usize) {
     let raw = match &self.backend {
       TextBackend::Ort(ort) => ort.tokenizer.clone(),
-      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
       TextBackend::Mlx { tokenizer, .. } => tokenizer.clone(),
     };
     // Read max_seq_len from the tokenizer's truncation params BEFORE clearing
@@ -397,18 +456,10 @@ impl TextEncoder {
       .get_truncation()
       .map(|t| t.max_length)
       .unwrap_or(DEFAULT_MAX_SEQ_LEN);
-    // Disable truncation so the clone tokenizes the full text for splitting.
+    // Disable truncation so the clone tokenizes the full text for windowing.
     let mut tok = raw;
     let _ = tok.with_truncation(None);
-    // Number of special tokens the post-processor adds for a single sequence
-    // (not a pair). We subtract this from the per-window budget so a
-    // re-embedded chunk — which re-adds these tokens — never exceeds
-    // `max_seq_len`.
-    let special_reserve = tok
-      .get_post_processor()
-      .map(|p| p.added_tokens(false))
-      .unwrap_or(0);
-    (tok, max_seq_len, special_reserve)
+    (tok, max_seq_len)
   }
 
   /// Embed a long `text` as overlapping windows (see [`crate::WindowOptions`]).
@@ -428,26 +479,29 @@ impl TextEncoder {
     text: &str,
     opts: &crate::window::WindowOptions,
   ) -> Result<Vec<crate::window::WindowEmbedding>> {
+    use crate::window::WindowEmbedding;
     if text.is_empty() {
       return Err(Error::EmptyText);
     }
-    let (tok, max_seq_len, reserve) = self.split_tokenizer();
-    let chunks = crate::window::split_windows(&tok, text, opts, max_seq_len, reserve)?;
-    if chunks.is_empty() {
+    let (tok, max_seq_len) = self.split_tokenizer();
+    let max_windows = self.backend.max_batch_size();
+    // Byte-exact: each window embeds the original encoding's token IDs verbatim,
+    // so the byte span describes exactly the tokens embedded.
+    let windows =
+      crate::window::fixed_token_id_windows(&tok, text, opts, max_seq_len, max_windows)?;
+    if windows.is_empty() {
       return Ok(Vec::new());
     }
-    let texts: Vec<&str> = chunks.iter().map(|(_, s)| s.as_str()).collect();
-    let embs = self.embed_batch(&texts)?;
+    let rows: Vec<Vec<u32>> = windows.iter().map(|(_, ids, _)| ids.clone()).collect();
+    let embs = self.embed_id_rows(&rows)?;
     Ok(
-      chunks
+      windows
         .into_iter()
         .zip(embs)
-        .map(
-          |((byte_span, _), embedding)| crate::window::WindowEmbedding {
-            byte_span,
-            embedding,
-          },
-        )
+        .map(|((byte_span, _, _), embedding)| WindowEmbedding {
+          byte_span,
+          embedding,
+        })
         .collect(),
     )
   }
@@ -470,20 +524,21 @@ impl TextEncoder {
     if text.is_empty() {
       return Err(Error::EmptyText);
     }
-    let (tok, max_seq_len, reserve) = self.split_tokenizer();
-    let chunks = crate::window::split_windows(&tok, text, opts, max_seq_len, reserve)?;
-    let texts: Vec<&str> = chunks.iter().map(|(_, s)| s.as_str()).collect();
-    let embs = self.embed_batch(&texts)?;
-    let weighted: Vec<(usize, Embedding)> = chunks
+    let (tok, max_seq_len) = self.split_tokenizer();
+    let max_windows = self.backend.max_batch_size();
+    let windows =
+      crate::window::fixed_token_id_windows(&tok, text, opts, max_seq_len, max_windows)?;
+    let rows: Vec<Vec<u32>> = windows.iter().map(|(_, ids, _)| ids.clone()).collect();
+    let embs = self.embed_id_rows(&rows)?;
+    // Weight each window by its REAL content-token count (the third tuple field),
+    // NOT the framed id-row length — the constant leading/trailing specials must
+    // not inflate a short final window's weight. An empty window set flows
+    // through to `pool_weighted`, which returns `Error::EmbeddingDim` (the
+    // documented zero-real-token outcome).
+    let weighted: Vec<(usize, Embedding)> = windows
       .iter()
       .zip(embs)
-      .map(|((_, s), e)| {
-        let n = tok
-          .encode(s.as_str(), false)
-          .map(|enc| enc.get_ids().len())
-          .unwrap_or(1);
-        (n.max(1), e)
-      })
+      .map(|((_, _, n), e)| ((*n).max(1), e))
       .collect();
     pool_weighted(&weighted)
   }
@@ -542,6 +597,30 @@ impl OrtTextEncoder {
     }
     Ok(out)
   }
+
+  /// Chunk **pre-tokenized id rows** into groups of `BatchOptions::batch_size`
+  /// and run one ORT inference per chunk — the windowing FixedToken path, which
+  /// embeds the original encoding's token IDs verbatim (no re-tokenization).
+  /// Mirrors [`Self::embed_batch`]'s chunk-by-`batch_size` loop, calling
+  /// [`embed_id_chunk`] per chunk with the tokenizer's `<pad>` id. The outer
+  /// [`TextEncoder::embed_id_rows`] has already rejected an oversized batch.
+  #[cfg(feature = "windowing")]
+  fn embed_id_rows(&mut self, rows: &[Vec<u32>]) -> Result<Vec<Embedding>> {
+    // The pad id the masked-off pad cells carry, from the loaded tokenizer's
+    // `<pad>` token (the same id `configure_tokenizer` pads with).
+    let pad_id = self
+      .tokenizer
+      .token_to_id(PAD_TOKEN)
+      .ok_or_else(|| Error::Tokenizer(format!("loaded tokenizer has no `{PAD_TOKEN}` token")))?;
+    let chunk = self.opts.batch().batch_size();
+    let mut out = Vec::with_capacity(rows.len());
+    for (chunk_idx, group) in rows.chunks(chunk).enumerate() {
+      let base_index = chunk_idx * chunk;
+      let chunk_emb = embed_id_chunk(&mut self.session, group, pad_id, base_index)?;
+      out.extend(chunk_emb);
+    }
+    Ok(out)
+  }
 }
 
 fn embed_chunk(
@@ -586,6 +665,54 @@ fn embed_chunk(
     }
     input_ids.extend(ids.iter().map(|&u| u as i64));
     attention_mask.extend(mask.iter().map(|&u| u as i64));
+  }
+
+  run_session(
+    session,
+    &input_ids,
+    &attention_mask,
+    batch,
+    seq_len,
+    base_index,
+  )
+}
+
+/// Build the `[batch, seq_len]` `i64` `input_ids` + `attention_mask` from
+/// **pre-tokenized id rows** and run the proven [`run_session`] forward — the
+/// windowing FixedToken path, which embeds the original encoding's token IDs
+/// verbatim (no re-tokenization). `seq_len` is the longest row; shorter rows are
+/// right-padded with `pad_id` and masked `0`, exactly as the `encode_batch`
+/// `BatchLongest` path pads in [`embed_chunk`]. A zero `seq_len` (only reachable
+/// from an all-empty group, which the windowing caller never produces) is
+/// reported as a row-unspecific `Error::Batch { EmptyText }`, mirroring
+/// [`embed_chunk`].
+#[cfg(feature = "windowing")]
+fn embed_id_chunk(
+  session: &mut ort::session::Session,
+  rows: &[Vec<u32>],
+  pad_id: u32,
+  base_index: usize,
+) -> Result<Vec<Embedding>> {
+  let batch = rows.len();
+  let seq_len = rows.iter().map(Vec::len).max().unwrap_or(0);
+  if seq_len == 0 {
+    return Err(Error::Batch {
+      index: base_index,
+      source: Box::new(Error::EmptyText),
+    });
+  }
+
+  let mut input_ids = Vec::with_capacity(batch * seq_len);
+  let mut attention_mask = Vec::with_capacity(batch * seq_len);
+  for row in rows {
+    for &id in row {
+      input_ids.push(id as i64);
+      attention_mask.push(1i64);
+    }
+    for _ in row.len()..seq_len {
+      input_ids.push(pad_id as i64);
+      attention_mask.push(0i64);
+    }
   }
 
   run_session(
@@ -834,7 +961,7 @@ fn configure_tokenizer(mut tokenizer: Tokenizer, max_seq_len: usize) -> Result<T
 /// unit test, and the future Phase C windowing path). Factored out of
 /// [`prepare_mlx_tokenizer`] so the truncation contract is unit-testable without
 /// a `tokenizer.json` fixture.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 fn configure_mlx_tokenizer(mut tokenizer: Tokenizer, max_seq_len: usize) -> Result<Tokenizer> {
   if max_seq_len == 0 {
     return Err(Error::InvalidMaxSeqLen);
@@ -868,7 +995,7 @@ fn configure_mlx_tokenizer(mut tokenizer: Tokenizer, max_seq_len: usize) -> Resu
 ///
 /// `configure_mlx_tokenizer` handles the actual padding/truncation setup and
 /// is factored out to be unit-testable without a `tokenizer.json` fixture.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn prepare_mlx_tokenizer(
   tokenizer_json: &Path,
   max_seq_len: usize,
@@ -906,7 +1033,7 @@ mod tests {
     );
   }
 
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   #[test]
   fn configure_mlx_tokenizer_truncates_to_max_seq_len() {
     use tokenizers::{
@@ -946,7 +1073,7 @@ mod tests {
     );
   }
 
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   #[test]
   fn mlx_with_options_rejects_invalid_batch_before_loading() {
     use crate::options::{BatchOptions, Options};

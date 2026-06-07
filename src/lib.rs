@@ -11,15 +11,15 @@
 pub(crate) mod backend_select;
 pub mod embedding;
 pub mod error;
-// MLX (`mlxrs`) inference backend — Apple Silicon only. Crate-internal: reached
-// through the platform auto-routing in `TextEncoder::from_dir` (there is no
-// public MLX entry point and no `mlx` feature — the backend is chosen by
-// platform, see Cargo.toml). Compiled on `aarch64-apple-darwin` whenever the
-// inference surface is built — it reuses the `tokenizers` text path and backs
-// the `inference`-gated `TextEncoder`, so an `--no-default-features` ONNX-free
-// build pulls in neither it nor `mlxrs`'s runtime use. `mlxrs` binds the MLX
-// C++ runtime and has no other target, so the backend exists nowhere else.
-#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+// MLX (`mlxrs`) inference backend — Apple Silicon only, opt-in via the `mlx`
+// feature. Crate-internal: reached through the platform auto-routing in
+// `TextEncoder::from_dir` (there is no public MLX entry point — the public
+// surface is `TextEncoder` plus the explicit MLX constructors, see Cargo.toml).
+// Compiled only on `aarch64-apple-darwin` with `mlx` on — it reuses the
+// `tokenizers` text path and backs `TextEncoder`, so a default (or
+// `--no-default-features`) build pulls in neither it nor `mlxrs`. `mlxrs` binds
+// the MLX C++ runtime and has no other target, so the backend exists nowhere else.
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 mod mlx;
 pub mod options;
 
@@ -42,10 +42,13 @@ pub use options::{Backend, BatchOptions, Options, ThreadOptions};
 pub mod window;
 #[cfg(feature = "windowing")]
 #[cfg_attr(docsrs, doc(cfg(feature = "windowing")))]
-pub use window::{WindowEmbedding, WindowOptions, WindowStrategy};
+pub use window::{WindowEmbedding, WindowOptions};
 
-#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
-#[cfg_attr(docsrs, doc(cfg(all(target_os = "macos", target_arch = "aarch64"))))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(
+  docsrs,
+  doc(cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64")))
+)]
 pub use error::MlxErrorKind;
 #[cfg(feature = "inference")]
 #[cfg_attr(docsrs, doc(cfg(feature = "inference")))]

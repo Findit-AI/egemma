@@ -8,8 +8,9 @@
 //! directory is an MLX checkpoint worth routing to the `mlxrs` Metal backend.
 //!
 //! Routing contract:
-//! - On **Apple Silicon**, `from_dir` prefers MLX when [`prefer_mlx`] is `true`
-//!   (an MLX `config.json` is present, a weight set in any ENABLED format is
+//! - On **Apple Silicon with the `mlx` feature**, `from_dir` prefers MLX when
+//!   [`prefer_mlx`] is `true` (an MLX `config.json` is present, a weight set in
+//!   any ENABLED format is
 //!   present — a sharded `model.safetensors.index.json` or a single
 //!   `model.safetensors` always, a `*.npz` only under the `npz` feature, a
 //!   `*.gguf` only under the `gguf` feature — AND **none** of the ONNX graph(s)
@@ -23,8 +24,9 @@
 //!   for that constructor and must route to ONNX — the presence of the required
 //!   graph is the signal that wins, because that file is the thing the ONNX
 //!   backend actually loads (the MLX backend never reads it).
-//! - On **every other platform**, only the ONNX backend is compiled, so
-//!   `from_dir` loads the ONNX graph unconditionally and this probe is unused.
+//! - Without the `mlx` feature (or on **any non-Apple-Silicon platform**), only
+//!   the ONNX backend is compiled, so `from_dir` loads the ONNX graph
+//!   unconditionally and this probe is unused.
 
 /// The EmbeddingGemma text-encoder ONNX graph file name inside a checkpoint
 /// directory (the canonical fp32 optimum export of
@@ -34,27 +36,27 @@ pub(crate) const TEXT_ONNX: &str = "model.onnx";
 
 /// The MLX-format config file name (the `mlxrs` checkpoint marker, paired with a
 /// weight file). Mirrors `crate::mlx`'s `CONFIG_FILE`.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) const MLX_CONFIG: &str = "config.json";
 
 /// The MLX-format safetensors weights file name — the always-available baseline
 /// weight format. Its presence (with [`MLX_CONFIG`]) is one signal `from_dir`
 /// routes to the MLX backend on Apple Silicon.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) const MLX_SAFETENSORS: &str = "model.safetensors";
 
 /// The legacy single-file safetensors weights name. Some older MLX checkpoints
 /// ship their weights as `weights.safetensors` rather than `model.safetensors`;
 /// `mlxrs::io::load_weights_from_dir` accepts it as a fallback tier, so its
 /// presence (with [`MLX_CONFIG`]) also routes to the MLX backend.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) const MLX_SAFETENSORS_LEGACY: &str = "weights.safetensors";
 
 /// The sharded-checkpoint index file name. A multi-shard safetensors export
 /// (`model-00001-of-0000N.safetensors` + …) ships a `model.safetensors.index.json`
 /// weight map instead of a single `model.safetensors`; `mlxrs::io::load_weights_from_dir`
 /// loads it, so its presence (with [`MLX_CONFIG`]) also routes to MLX.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) const MLX_SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
 
 /// Report whether `dir` holds an MLX weight set in any ENABLED format:
@@ -64,7 +66,7 @@ pub(crate) const MLX_SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
 /// [`mlxrs::io::load_weights_from_dir`] loads, so routing and loading agree on
 /// which checkpoints count. A dir with only `model.npz` therefore routes to MLX
 /// iff `npz` is on.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 fn has_mlx_weights(dir: &std::path::Path) -> bool {
   if dir.join(MLX_SAFETENSORS_INDEX).is_file() {
     return true;
@@ -90,6 +92,7 @@ fn has_mlx_weights(dir: &std::path::Path) -> bool {
 /// referenced from the `npz`/`gguf` arms of [`has_mlx_weights`], so it is
 /// `cfg`-elided on a default (safetensors-only) build.
 #[cfg(all(
+  feature = "mlx",
   target_os = "macos",
   target_arch = "aarch64",
   any(feature = "npz", feature = "gguf")
@@ -109,7 +112,9 @@ fn has_extension(dir: &std::path::Path, extension: &str) -> bool {
 pub(crate) enum Routed {
   /// Load via ONNX Runtime.
   Onnx,
-  /// Load via the MLX backend.
+  /// Load via the MLX backend. Only exists when the MLX backend is compiled (the
+  /// `mlx` feature on Apple Silicon); the non-MLX `route` never yields it.
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   Mlx,
 }
 
@@ -118,12 +123,7 @@ pub(crate) enum Routed {
 /// forces ONNX; `Mlx` forces MLX and errors with
 /// [`crate::Error::BackendUnavailable`] when the directory holds no MLX
 /// checkpoint.
-#[cfg(all(
-  feature = "inference",
-  not(target_arch = "wasm32"),
-  target_os = "macos",
-  target_arch = "aarch64"
-))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn route(
   dir: &std::path::Path,
   backend: crate::options::Backend,
@@ -153,12 +153,13 @@ pub(crate) fn route(
   }
 }
 
-/// Off Apple Silicon only the ONNX backend exists, so `Auto`/`Onnx` route to
-/// ONNX and `Mlx` is unavailable.
+/// When the MLX backend is not compiled — the `mlx` feature is off, or any
+/// non-Apple-Silicon target — only ONNX exists, so `Auto`/`Onnx` route to ONNX
+/// and a forced `Mlx` is unavailable.
 #[cfg(all(
   feature = "inference",
   not(target_arch = "wasm32"),
-  not(all(target_os = "macos", target_arch = "aarch64"))
+  not(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))
 ))]
 pub(crate) fn route(
   _dir: &std::path::Path,
@@ -170,7 +171,7 @@ pub(crate) fn route(
     Backend::Auto | Backend::Onnx => Ok(Routed::Onnx),
     Backend::Mlx => Err(crate::Error::BackendUnavailable {
       requested: Backend::Mlx,
-      reason: "the MLX backend is only available on aarch64-apple-darwin".to_string(),
+      reason: "the MLX backend requires the `mlx` feature on aarch64-apple-darwin".to_string(),
     }),
   }
 }
@@ -195,7 +196,7 @@ pub(crate) fn route(
 /// constructor that wins does the real load (and surfaces a typed error if the
 /// chosen checkpoint is malformed), so this stays a cheap, side-effect-free
 /// dispatch decision.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn prefer_mlx(dir: &std::path::Path, required_onnx: &[&str]) -> bool {
   dir.join(MLX_CONFIG).is_file()
     && has_mlx_weights(dir)
@@ -218,20 +219,22 @@ mod route_tests {
     let _ = std::fs::remove_dir_all(&tmp);
   }
 
-  #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+  #[cfg(not(all(feature = "mlx", target_os = "macos", target_arch = "aarch64")))]
   #[test]
-  fn route_mlx_unavailable_off_apple_silicon() {
+  fn route_mlx_unavailable_without_mlx_backend() {
     let tmp = std::env::temp_dir().join(format!("egemma_route_mlx_off_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("mkdir");
+    // The MLX backend is not compiled here (the `mlx` feature is off, or a
+    // non-Apple-Silicon target), so forcing `Backend::Mlx` must error.
     let err = route(&tmp, Backend::Mlx, &[TEXT_ONNX])
       .err()
-      .expect("forcing Mlx off Apple Silicon must error");
+      .expect("forcing Mlx without the MLX backend must error");
     assert!(matches!(err, crate::Error::BackendUnavailable { .. }));
     let _ = std::fs::remove_dir_all(&tmp);
   }
 
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   #[test]
   fn route_mlx_unavailable_when_no_mlx_checkpoint() {
     let tmp = std::env::temp_dir().join(format!("egemma_route_mlx_empty_{}", std::process::id()));
@@ -245,7 +248,7 @@ mod route_tests {
     let _ = std::fs::remove_dir_all(&tmp);
   }
 
-  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   #[test]
   fn route_onnx_forced_over_present_mlx_checkpoint() {
     let tmp = std::env::temp_dir().join(format!("egemma_route_force_onnx_{}", std::process::id()));
@@ -264,7 +267,7 @@ mod route_tests {
   }
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(test, feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 mod tests {
   use super::*;
 

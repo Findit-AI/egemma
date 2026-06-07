@@ -21,6 +21,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- MLX (`mlxrs`) Metal inference backend behind the opt-in `mlx` feature (Apple
+  Silicon only, **off by default**). `TextEncoder::from_dir` auto-routes to it
+  when an MLX checkpoint is present; explicit `from_safetensors` (and the
+  feature-gated `from_npz` / `from_gguf`) load a known MLX weight file. The
+  default build — including on Apple Silicon — stays ONNX-only, so `TextEncoder`
+  remains `Send`; enable `--features mlx` for the Metal backend.
 - `Backend` selector (`Auto`/`Onnx`/`Mlx`) on `Options` via `with_backend`.
 - `TextEncoder::from_dir_with_options`, `from_safetensors_with_options`, and
   (feature-gated) `from_npz_with_options` / `from_gguf_with_options`.
@@ -32,8 +38,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   dimension (replaces the removed `EMBED_DIM`).
 - `windowing` feature (off by default): `TextEncoder::embed_windows` (per-window
   vectors) and `embed_pooled` (token-weighted mean) for inputs longer than the
-  model window, with `WindowStrategy::{FixedToken, Semantic}` and configurable
-  size/overlap. Pulls `text-splitter` (+ ICU); enable with `--features windowing`.
+  model window. Byte-exact fixed-token windows (`WindowOptions` with configurable
+  size/overlap) that embed the original token IDs verbatim — no re-tokenization,
+  no silent truncation. Enable with `--features windowing`.
 
 ## [0.1.0]
 

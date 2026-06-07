@@ -8,7 +8,7 @@ use thiserror::Error;
 /// the checkpoint config, loading weights, or the inference forward pass. Lets
 /// callers branch (e.g. retry `Runtime`, fail-fast `Config`) even though the
 /// underlying `mlxrs::Error` text is opaque.
-#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MlxErrorKind {
   /// Config read / parse / `Gemma3Config::validate`.
@@ -191,7 +191,7 @@ pub enum Error {
   /// Compiled only on the Apple-Silicon target (the only place the backend
   /// exists). The `mlxrs::Error` is captured as its `Display` string so this
   /// crate's public `Error` does not leak the `mlxrs` type into its API.
-  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   #[error("mlx backend {kind:?} error: {message}")]
   Mlx {
     /// Which phase of the backend failed.
@@ -209,7 +209,7 @@ pub enum Error {
   /// implement `std::error::Error` on stable Rust today, so its `Display` is
   /// captured as a string. Compiled only on the Apple-Silicon target (the only
   /// place the MLX backend exists).
-  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   #[error("failed to allocate {requested_bytes} bytes for `{which}` scratch buffer: {cause}")]
   AllocationFailed {
     /// Buffer the allocator was asked to reserve.
@@ -221,7 +221,7 @@ pub enum Error {
   },
 }
 
-#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 impl Error {
   /// Build an [`Error::Mlx`] from a static reason string.
   pub(crate) fn mlx(kind: MlxErrorKind, reason: &'static str) -> Self {
@@ -295,7 +295,7 @@ mod tests {
     assert!(msg.contains("not apple silicon"), "got {msg:?}");
   }
 
-  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
   #[test]
   fn mlx_error_displays_kind_and_message() {
     let e = Error::Mlx {

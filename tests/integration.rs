@@ -184,7 +184,7 @@ fn embed_windows_long_input_produces_multiple_windows() {
     representations called embeddings, which capture semantic meaning. ";
   let long_text: String = paragraph.repeat(80);
 
-  let opts = egemma::WindowOptions::new(egemma::WindowStrategy::FixedToken);
+  let opts = egemma::WindowOptions::new();
   let windows = encoder
     .embed_windows(&long_text, &opts)
     .expect("embed_windows must succeed on a long input");

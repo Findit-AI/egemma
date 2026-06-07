@@ -1,19 +1,21 @@
-//! MLX (mlxrs) inference backend — Apple-Silicon only.
+//! MLX (mlxrs) inference backend — Apple-Silicon only, opt-in via `mlx`.
 //!
 //! This is the macOS/arm64 alternative to the default `ort` (ONNX Runtime)
-//! inference path. It is compiled unconditionally on `aarch64-apple-darwin`
-//! (and nowhere else), because `mlxrs` binds the Metal-backed MLX C++ runtime
-//! through `mlx-c` FFI and has no other target. There is no `mlx` Cargo feature
-//! — the backend is selected automatically by platform (see Cargo.toml).
+//! inference path. It is compiled only on `aarch64-apple-darwin` with the opt-in
+//! `mlx` Cargo feature (and nowhere else), because `mlxrs` binds the Metal-backed
+//! MLX C++ runtime through `mlx-c` FFI and has no other target. With `mlx` on,
+//! `TextEncoder::from_dir` auto-routes to this backend when an MLX checkpoint is
+//! present (see Cargo.toml); without it the crate is ONNX-only.
 //!
 //! # Design
 //!
 //! [`crate::TextEncoder`] holds an internal backend enum (`Backend::Ort` vs
 //! `Backend::Mlx`). The ONNX path is untouched; the MLX path is reached through
 //! the platform auto-routing in [`crate::TextEncoder::from_dir`] (which probes
-//! the checkpoint directory and picks MLX when an MLX checkpoint is present),
-//! never a user-facing backend knob. Both backends expose the **same** public
-//! API and return the same [`crate::Embedding`] (L2-normalized; dimension per the checkpoint).
+//! the checkpoint directory and picks MLX when an MLX checkpoint is present), or
+//! an explicit [`Backend`](crate::options::Backend) override. Both backends
+//! expose the **same** public API and return the same [`crate::Embedding`]
+//! (L2-normalized; dimension per the checkpoint).
 //!
 //! # Weight source
 //!
@@ -201,7 +203,12 @@ impl MlxModel {
 
     let config_path = dir.join(CONFIG_FILE);
 
-    let config_json = std::fs::read_to_string(&config_path)?;
+    let config_json = std::fs::read_to_string(&config_path).map_err(|e| {
+      Error::mlx_owned(
+        MlxErrorKind::Config,
+        format!("failed to read {}: {e}", config_path.display()),
+      )
+    })?;
     let config = Gemma3Config::from_json(&config_json)
       .map_err(|e| Error::from_mlx(MlxErrorKind::Config, e))?;
 
@@ -348,6 +355,80 @@ impl MlxModel {
     }
     Ok(out)
   }
+
+  /// Encode a batch of **pre-tokenized id rows** — the windowing path's
+  /// byte-exact FixedToken entry, which embeds the original encoding's token IDs
+  /// verbatim instead of re-tokenizing chunk strings. Each row is right-padded to
+  /// the batch maximum with the Gemma `<pad>` id (the same dynamic-right-pad
+  /// contract `embed_text_batch` uses), the matching `0/1` attention mask is
+  /// built, and the batch runs through the bidirectional backbone + mean-pool +
+  /// Dense head in one `encode_text` call per chunk.
+  ///
+  /// Mirrors [`Self::embed_text_batch`]'s structure exactly: empty → `Ok(vec![])`;
+  /// an over-cap batch → [`Error::BatchTooLarge`] before allocating; the request
+  /// is split into `batch_size`-row chunks; each chunk-level / row-level failure
+  /// is wrapped with the offending input index via [`Error::Batch`].
+  #[cfg(feature = "windowing")]
+  pub(crate) fn embed_id_batch(&self, rows: &[Vec<u32>]) -> Result<Vec<Embedding>> {
+    if rows.is_empty() {
+      return Ok(Vec::new());
+    }
+    if rows.len() > self.max_batch_size {
+      return Err(Error::BatchTooLarge {
+        got: rows.len(),
+        max: self.max_batch_size,
+      });
+    }
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (chunk_idx, group) in rows.chunks(self.batch_size).enumerate() {
+      let base = chunk_idx * self.batch_size;
+      let TextBatch {
+        input_ids,
+        attention_mask,
+        batch,
+        seq_len,
+      } = build_id_batch(group, self.pad_token_id).map_err(|e| Error::Batch {
+        index: base,
+        source: Box::new(e),
+      })?;
+
+      let input_ids =
+        mlxrs::Array::from_slice::<i32>(&input_ids, &(batch, seq_len)).map_err(|e| {
+          Error::Batch {
+            index: base,
+            source: Box::new(Error::from_mlx(MlxErrorKind::Runtime, e)),
+          }
+        })?;
+      let attention_mask = mlxrs::Array::from_slice::<f32>(&attention_mask, &(batch, seq_len))
+        .map_err(|e| Error::Batch {
+          index: base,
+          source: Box::new(Error::from_mlx(MlxErrorKind::Runtime, e)),
+        })?;
+
+      let pooled = self
+        .model
+        .encode_text(&input_ids, &attention_mask)
+        .map_err(|e| Error::Batch {
+          index: base,
+          source: Box::new(Error::from_mlx(MlxErrorKind::Runtime, e)),
+        })?;
+      for (row_idx, row) in eval_rows(&pooled, batch)
+        .map_err(|e| Error::Batch {
+          index: base,
+          source: Box::new(e),
+        })?
+        .into_iter()
+        .enumerate()
+      {
+        out.push(embedding_from_row(row).map_err(|e| Error::Batch {
+          index: base + row_idx,
+          source: Box::new(e),
+        })?);
+      }
+    }
+    Ok(out)
+  }
 }
 
 /// A small extension that surfaces the model's dynamic-right-pad `pad_token_id`
@@ -445,6 +526,70 @@ fn build_text_batch(tokenizer: &Tokenizer, texts: &[&str], pad_token_id: u32) ->
       attention_mask.push(1.0);
     }
     for _ in ids.len()..seq_len {
+      input_ids.push(pad);
+      attention_mask.push(0.0);
+    }
+  }
+
+  Ok(TextBatch {
+    input_ids,
+    attention_mask,
+    batch,
+    seq_len,
+  })
+}
+
+/// Build the flat `(batch * seq_len)` row-major `i32` `input_ids` + `f32`
+/// `attention_mask` matrices from **pre-tokenized id rows** under the same
+/// dynamic-right-pad contract as [`build_text_batch`]: every row is right-padded
+/// to the batch maximum real length with `pad_token_id`, the mask is `1.0` over
+/// real tokens and `0.0` over pad cells.
+///
+/// The windowing FixedToken path passes the original encoding's token IDs here
+/// verbatim (no re-tokenization), so the embedded tokens are byte-exact. Shares
+/// [`build_text_batch`]'s allocation discipline (`checked_mul` for the geometry,
+/// `try_reserve_exact` for the buffers → [`Error::AllocationFailed`]) and the
+/// [`checked_id`] u32→i32 conversion. The caller enforces the `max_batch_size`
+/// cap (in `embed_id_batch`, before this call). An empty `rows` yields a
+/// `seq_len`-0 / `batch`-0 batch — but the caller returns early on empty, so this
+/// is reached only with a non-empty group.
+#[cfg(feature = "windowing")]
+fn build_id_batch(rows: &[Vec<u32>], pad_token_id: u32) -> Result<TextBatch> {
+  // The padded sequence length is the batch's longest row.
+  let seq_len = rows.iter().map(Vec::len).max().unwrap_or(0);
+  let batch = rows.len();
+
+  let total = batch.checked_mul(seq_len).ok_or_else(|| {
+    Error::mlx_owned(
+      MlxErrorKind::Runtime,
+      format!("batch {batch} * seq_len {seq_len} overflows usize"),
+    )
+  })?;
+
+  let mut input_ids: Vec<i32> = Vec::new();
+  input_ids
+    .try_reserve_exact(total)
+    .map_err(|e| Error::AllocationFailed {
+      which: "mlx id input_ids",
+      requested_bytes: total.saturating_mul(std::mem::size_of::<i32>()),
+      cause: e.to_string(),
+    })?;
+  let mut attention_mask: Vec<f32> = Vec::new();
+  attention_mask
+    .try_reserve_exact(total)
+    .map_err(|e| Error::AllocationFailed {
+      which: "mlx id attention_mask",
+      requested_bytes: total.saturating_mul(std::mem::size_of::<f32>()),
+      cause: e.to_string(),
+    })?;
+
+  let pad = checked_id(pad_token_id)?;
+  for row in rows {
+    for &id in row {
+      input_ids.push(checked_id(id)?);
+      attention_mask.push(1.0);
+    }
+    for _ in row.len()..seq_len {
       input_ids.push(pad);
       attention_mask.push(0.0);
     }
@@ -665,6 +810,34 @@ mod tests {
         }
       ),
       "expected Error::Mlx{{Config}} for an invalid config, got {err}"
+    );
+  }
+
+  /// A MISSING `config.json` is a config-phase failure: `construct` reads it with
+  /// the error mapped to `Error::Mlx { kind: Config }`, not a bare `Error::Io`,
+  /// so the `MlxErrorKind` contract holds for an unreadable config too.
+  #[test]
+  fn from_dir_missing_config_is_tagged_config() {
+    let dir = std::env::temp_dir().join(format!(
+      "egemma_mlx_noconfig_{}_{:?}",
+      std::process::id(),
+      std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    // No config.json written — the read must fail, tagged Config.
+    let result = MlxModel::from_dir(&dir, BatchOptions::default());
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = result.err().expect("missing config.json must error");
+    assert!(
+      matches!(
+        err,
+        Error::Mlx {
+          kind: MlxErrorKind::Config,
+          ..
+        }
+      ),
+      "expected Error::Mlx{{Config}} for a missing config.json, got {err}"
     );
   }
 
