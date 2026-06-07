@@ -182,14 +182,16 @@ impl TextEncoder {
   /// Crate-internal — the user's directory entry point is [`Self::from_dir`],
   /// which auto-routes here on Apple Silicon when an MLX checkpoint is present.
   /// The tokenizer is loaded from `tokenizer.json` in the same directory via
-  /// `prepare_mlx_tokenizer`: its serialized padding/truncation are **disabled**
-  /// (so `encode` returns each row's real ids plus the post-processor's BOS),
-  /// and the dynamic-right-pad to the batch maximum is built manually under
-  /// `mlxrs`'s EmbeddingGemma contract.
+  /// `prepare_mlx_tokenizer`: built-in **padding** is disabled (the dynamic
+  /// right-pad to the batch maximum is built manually under `mlxrs`'s
+  /// EmbeddingGemma contract), and right **truncation** is **enabled** — inputs
+  /// longer than `opts.batch().max_seq_len()` are clipped before the forward
+  /// pass. The Phase C windowing path bypasses truncation by operating on the
+  /// full text.
   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
   pub(crate) fn from_mlx_dir_with_options(dir: &Path, opts: Options) -> Result<Self> {
     let model = crate::mlx::MlxModel::from_dir(dir, opts.batch())?;
-    let tokenizer = prepare_mlx_tokenizer(&dir.join("tokenizer.json"))?;
+    let tokenizer = prepare_mlx_tokenizer(&dir.join("tokenizer.json"), opts.batch().max_seq_len())?;
     Ok(Self {
       backend: TextBackend::Mlx { model, tokenizer },
     })
@@ -217,8 +219,10 @@ impl TextEncoder {
   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
   pub fn from_safetensors_with_options(weights: &Path, opts: Options) -> Result<Self> {
     let model = crate::mlx::MlxModel::from_safetensors(weights, opts.batch())?;
-    let tokenizer =
-      prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
+    let tokenizer = prepare_mlx_tokenizer(
+      &crate::mlx::weights_parent(weights).join("tokenizer.json"),
+      opts.batch().max_seq_len(),
+    )?;
     Ok(Self {
       backend: TextBackend::Mlx { model, tokenizer },
     })
@@ -243,8 +247,10 @@ impl TextEncoder {
   #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz"))]
   pub fn from_npz_with_options(weights: &Path, opts: Options) -> Result<Self> {
     let model = crate::mlx::MlxModel::from_npz(weights, opts.batch())?;
-    let tokenizer =
-      prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
+    let tokenizer = prepare_mlx_tokenizer(
+      &crate::mlx::weights_parent(weights).join("tokenizer.json"),
+      opts.batch().max_seq_len(),
+    )?;
     Ok(Self {
       backend: TextBackend::Mlx { model, tokenizer },
     })
@@ -271,8 +277,10 @@ impl TextEncoder {
   #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf"))]
   pub fn from_gguf_with_options(weights: &Path, opts: Options) -> Result<Self> {
     let model = crate::mlx::MlxModel::from_gguf(weights, opts.batch())?;
-    let tokenizer =
-      prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
+    let tokenizer = prepare_mlx_tokenizer(
+      &crate::mlx::weights_parent(weights).join("tokenizer.json"),
+      opts.batch().max_seq_len(),
+    )?;
     Ok(Self {
       backend: TextBackend::Mlx { model, tokenizer },
     })
@@ -649,38 +657,103 @@ fn configure_tokenizer(mut tokenizer: Tokenizer, max_seq_len: usize) -> Result<T
   Ok(tokenizer)
 }
 
+/// Disable the tokenizer's built-in **padding** (the MLX path builds the
+/// dynamic right-pad manually) and enable right **truncation** to `max_seq_len`
+/// so an over-long input is bounded — symmetric with the ORT path's
+/// [`configure_tokenizer`], except a zero `max_seq_len` is reported as the typed
+/// [`Error::InvalidMaxSeqLen`] (the ORT path surfaces it as `Error::Tokenizer`).
+/// In normal use [`crate::BatchOptions::validate`] has already rejected a zero
+/// `max_seq_len` before this runs; the guard here protects direct callers (the
+/// unit test, and the future Phase C windowing path). Factored out of
+/// [`prepare_mlx_tokenizer`] so the truncation contract is unit-testable without
+/// a `tokenizer.json` fixture.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn configure_mlx_tokenizer(mut tokenizer: Tokenizer, max_seq_len: usize) -> Result<Tokenizer> {
+  if max_seq_len == 0 {
+    return Err(Error::InvalidMaxSeqLen);
+  }
+  tokenizer.with_padding(None);
+  tokenizer
+    .with_truncation(Some(TruncationParams {
+      direction: TruncationDirection::Right,
+      max_length: max_seq_len,
+      strategy: TruncationStrategy::LongestFirst,
+      stride: 0,
+    }))
+    .map_err(|e| Error::Tokenizer(e.to_string()))?;
+  Ok(tokenizer)
+}
+
 /// Load and prepare the tokenizer for the **MLX** text path from `tokenizer.json`.
 ///
 /// The MLX path builds the `(batch, seq)` `input_ids` + `attention_mask`
 /// tensors itself under EmbeddingGemma's dynamic-right-pad contract
 /// (right-pad each row to the batch maximum real length with the Gemma `<pad>`
 /// id, mask `0` over pad cells), so the tokenizer's own built-in **padding** is
-/// disabled here — left enabled it would right-pad each row to a fixed/longest
-/// length with extra special handling the wrapper does not expect. The
-/// **truncation** is likewise disabled: EmbeddingGemma's `mlxrs` contract is
-/// `Padding::DynamicRightPad` with no per-text truncation cap — the library
-/// faithfully tokenizes whatever it is handed and the consuming application
-/// bounds an oversized / untrusted prompt (the library contract; no DoS guard
-/// here). `encode` then returns each row's real ids plus the post-processor's
-/// special tokens (BOS).
+/// disabled — left enabled it would right-pad each row to a fixed/longest
+/// length with extra special handling the wrapper does not expect.
 ///
-/// `with_truncation(None)` is infallible here (it only errors on
-/// `stride > max_length`, irrelevant when clearing); `with_padding(None)` is
-/// infallible.
+/// **Truncation is now ENABLED**: inputs longer than `max_seq_len` tokens are
+/// right-truncated to `max_seq_len`, bounding over-long or untrusted prompts
+/// symmetrically with the ORT path. The Phase C windowing path bypasses this
+/// by operating on the full text (it sizes windows against the non-truncating
+/// tokenizer view before splitting).
+///
+/// `configure_mlx_tokenizer` handles the actual padding/truncation setup and
+/// is factored out to be unit-testable without a `tokenizer.json` fixture.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn prepare_mlx_tokenizer(tokenizer_json: &Path) -> Result<Tokenizer> {
-  let mut tokenizer =
+pub(crate) fn prepare_mlx_tokenizer(
+  tokenizer_json: &Path,
+  max_seq_len: usize,
+) -> Result<Tokenizer> {
+  let tokenizer =
     Tokenizer::from_file(tokenizer_json).map_err(|e| Error::Tokenizer(e.to_string()))?;
-  tokenizer
-    .with_truncation(None)
-    .map_err(|e| Error::Tokenizer(e.to_string()))?;
-  tokenizer.with_padding(None);
-  Ok(tokenizer)
+  configure_mlx_tokenizer(tokenizer, max_seq_len)
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[test]
+  fn configure_mlx_tokenizer_truncates_to_max_seq_len() {
+    use tokenizers::{
+      Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
+    };
+
+    // Tiny whitespace WordLevel tokenizer: words "a".."e" + <pad> + [UNK].
+    // Collect into AHashMap via type inference — `WordLevel::builder().vocab()`
+    // requires `AHashMap<String, u32>` (tokenizers 0.23 uses ahash internally).
+    let vocab = [
+      ("a", 0u32),
+      ("b", 1),
+      ("c", 2),
+      ("d", 3),
+      ("e", 4),
+      ("<pad>", 5),
+      ("[UNK]", 6),
+    ]
+    .into_iter()
+    .map(|(w, id)| (w.to_string(), id))
+    .collect();
+    let model = WordLevel::builder()
+      .vocab(vocab)
+      .unk_token("[UNK]".to_string())
+      .build()
+      .unwrap();
+    let mut tok = Tokenizer::new(model);
+    tok.with_pre_tokenizer(Some(Whitespace::default()));
+
+    let configured = configure_mlx_tokenizer(tok, 3).expect("configure ok");
+    let enc = configured.encode("a b c d e", false).expect("encode ok");
+    assert_eq!(enc.get_ids().len(), 3, "must truncate to max_seq_len=3");
+    // Padding must remain disabled (manual dynamic right-pad happens later).
+    assert!(
+      configured.get_padding().is_none(),
+      "built-in padding must stay off"
+    );
+  }
 
   #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
   #[test]
