@@ -30,7 +30,6 @@ pub(crate) fn dot_768(a: &[f32; 768], b: &[f32; 768]) -> f32 {
 /// reduction auto-vectorizes under `-O3`; the remainder (len % 4) is folded in
 /// scalar. Precondition: `a.len() == b.len()` (callers ensure this; on a
 /// mismatch the shorter length is used via `zip`, never an out-of-bounds read).
-#[allow(dead_code)]
 #[cfg_attr(not(tarpaulin), inline(always))]
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
   let mut acc = [0.0f32; 4];

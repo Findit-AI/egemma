@@ -1,13 +1,15 @@
-//! `Embedding` — L2-normalized 768-dim sentence embedding.
+//! `Embedding` — L2-normalized, runtime-dimensioned sentence embedding.
 
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
-/// L2-normalized embedding. Length is `EMBED_DIM` (768) in 0.1.0.
+/// L2-normalized sentence embedding. Length is runtime-determined (see
+/// [`Self::dim`]); 768 for the base export, smaller for Matryoshka checkpoints
+/// or after [`Self::to_matryoshka`].
 ///
 /// `Embedding` deliberately does **not** implement `Serialize` or `Deserialize`.
-/// An auto-derived `Deserialize` would bypass the dim and L2-norm invariants
+/// An auto-derived `Deserialize` would bypass the L2-norm invariant
 /// that `TryFrom<Vec<f32>>` exists to enforce. Round-trip via the inner
 /// representation:
 ///
@@ -17,21 +19,24 @@ use crate::error::{Error, Result};
 ///
 /// // Deserialize via the validated path:
 /// let v: Vec<f32> = serde_json::from_str(&json)?;
-/// let embedding  = Embedding::try_from(v)?;  // validates dim + L2-norm
+/// let embedding  = Embedding::try_from(v)?;  // validates L2-norm (any non-zero length)
 /// ```
 #[derive(Clone, Debug)]
 pub struct Embedding(Arc<[f32]>);
 
 impl Embedding {
-  /// 0.1.0 supports only the 768-dim base export.
-  pub const EMBED_DIM: usize = 768;
+  /// The dimension of the canonical EmbeddingGemma base export. `Embedding` no
+  /// longer enforces this — its dimension is runtime-determined (see
+  /// [`Self::dim`]) to support Matryoshka checkpoints (128/256/512) — but the
+  /// value is kept as documentation of the common case.
+  pub const DEFAULT_DIM: usize = 768;
 
   /// L2-norm tolerance for the unit-norm invariant.
   pub const NORM_EPSILON: f32 = 5e-4;
 
-  /// Number of `f32` lanes in the embedding. Always [`Self::EMBED_DIM`]
-  /// (768) for any `Embedding` produced by this crate's public
-  /// constructors.
+  /// Number of `f32` lanes in the embedding. Runtime-determined; 768 for
+  /// any `Embedding` produced from the base export, smaller for Matryoshka
+  /// checkpoints or after [`Self::to_matryoshka`].
   pub fn dim(&self) -> usize {
     self.0.len()
   }
@@ -54,11 +59,7 @@ impl Embedding {
   /// `Embedding` in this crate is L2-normalized at construction.
   ///
   /// Returns [`crate::Error::EmbeddingDim`] when `self.dim() != other.dim()`
-  /// or when either operand's dim doesn't equal [`Self::EMBED_DIM`]. In
-  /// 0.1.0 every public constructor (`try_from`, `from_model_output` via
-  /// `TextEncoder`) produces a 768-d `Embedding`, so the error path is
-  /// only reachable in-crate; the check is forward-compatibility for
-  /// variable-dim embeddings and a guard against future internal misuse.
+  /// or when `self.dim() == 0`.
   ///
   /// Internally dispatches through the crate-private SIMD layer — picks
   /// NEON on aarch64, AVX2+FMA on x86_64 (when the runtime CPU
@@ -71,45 +72,20 @@ impl Embedding {
         got: other.dim(),
       });
     }
-    let a: &[f32; Self::EMBED_DIM] =
-      self
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::EmbeddingDim {
-          expected: Self::EMBED_DIM,
-          got: self.dim(),
-        })?;
-    let b: &[f32; Self::EMBED_DIM] =
-      other
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::EmbeddingDim {
-          expected: Self::EMBED_DIM,
-          got: other.dim(),
-        })?;
-    Ok(crate::simd::dot_768(a, b))
+    if self.dim() == 0 {
+      return Err(Error::EmbeddingDim {
+        expected: 1,
+        got: 0,
+      });
+    }
+    Ok(crate::simd::dot(self.as_slice(), other.as_slice()))
   }
 
-  /// Crate-internal: build an `Embedding` from raw model output. The
-  /// `embedding-gemma` ONNX export emits `sentence_embedding` that may
-  /// or may not be L2-normalized depending on the optimum-export pipeline
-  /// — we re-normalize unconditionally so downstream cosine code is
-  /// always operating on unit-norm vectors. Rejection only happens for
-  /// dim mismatch, all-zero output (degenerate model state), or
-  /// non-finite components.
-  ///
-  /// The `TryFrom<Vec<f32>>` path keeps the strict near-unit-norm check
-  /// — that's for *caller-supplied* embeddings (e.g., deserialized from
-  /// a vector store) which should already be unit-norm; silent renorm
-  /// there would mask data corruption.
-  #[cfg(feature = "inference")]
-  pub(crate) fn from_model_output(data: &[f32]) -> Result<Self> {
-    let arr: &[f32; Self::EMBED_DIM] = data.try_into().map_err(|_| Error::EmbeddingDim {
-      expected: Self::EMBED_DIM,
-      got: data.len(),
-    })?;
-    let norm_sq = crate::simd::dot_768(arr, arr);
-    let norm = norm_sq.sqrt();
+  /// Normalize an arbitrary-length finite vector to unit L2 norm, rejecting a
+  /// zero/non-finite norm. Not feature-gated (used by both the inference output
+  /// path and the always-available `to_matryoshka`).
+  fn normalized(data: &[f32]) -> Result<Self> {
+    let norm = crate::simd::dot(data, data).sqrt();
     if !norm.is_finite() || norm == 0.0 {
       return Err(Error::NotNormalized {
         norm,
@@ -117,32 +93,56 @@ impl Embedding {
       });
     }
     let factor = 1.0 / norm;
-    let arc: Arc<[f32]> = data.iter().map(|&x| x * factor).collect();
-    Ok(Self(arc))
+    Ok(Self(data.iter().map(|&x| x * factor).collect()))
+  }
+
+  /// Crate-internal: build an `Embedding` from raw model output. The
+  /// `embedding-gemma` ONNX export emits `sentence_embedding` that may
+  /// or may not be L2-normalized depending on the optimum-export pipeline
+  /// — we re-normalize unconditionally so downstream cosine code is
+  /// always operating on unit-norm vectors. Rejection only happens for
+  /// all-zero output (degenerate model state), or non-finite components.
+  ///
+  /// The `TryFrom<Vec<f32>>` path keeps the strict near-unit-norm check
+  /// — that's for *caller-supplied* embeddings (e.g., deserialized from
+  /// a vector store) which should already be unit-norm; silent renorm
+  /// there would mask data corruption.
+  #[cfg(feature = "inference")]
+  pub(crate) fn from_model_output(data: &[f32]) -> Result<Self> {
+    Self::normalized(data)
+  }
+
+  /// Prefix-truncate this embedding to `dim` dimensions and L2-renormalize —
+  /// the supported way to get a 512/256/128-d Matryoshka vector from a 768-d
+  /// base embedding (EmbeddingGemma is MRL-trained). Returns
+  /// [`Error::EmbeddingDim`] if `dim` is 0 or greater than [`Self::dim`].
+  pub fn to_matryoshka(&self, dim: usize) -> Result<Embedding> {
+    if dim == 0 || dim > self.dim() {
+      return Err(Error::EmbeddingDim {
+        expected: self.dim(),
+        got: dim,
+      });
+    }
+    // A prefix of a unit vector isn't unit-norm; renormalize via the
+    // private normalizing helper (which normalizes unconditionally).
+    Self::normalized(&self.as_slice()[..dim])
   }
 }
 
 impl TryFrom<Vec<f32>> for Embedding {
   type Error = Error;
 
-  /// Validates dim (`Error::EmbeddingDim`) and L2-norm
-  /// (`Error::NotNormalized`, tolerance `NORM_EPSILON`). This path is for
-  /// **caller-supplied** embeddings — typically deserialized from a
-  /// vector store — that should already be unit-norm; we reject (rather
-  /// than silently renormalize) so corruption can't slip through.
+  /// Validates L2-norm (`Error::NotNormalized`, tolerance `NORM_EPSILON`).
+  /// This path is for **caller-supplied** embeddings — typically deserialized
+  /// from a vector store — that should already be unit-norm; we reject (rather
+  /// than silently renormalize) so corruption can't slip through. Any non-empty
+  /// length is accepted as long as the norm is near 1.0.
   ///
   /// Vectors whose `||v||₂` is within `NORM_EPSILON` of 1.0 are
   /// snapped to exactly 1.0 (in-place renorm preserves the cosine
   /// invariant under tiny f32 drift).
   fn try_from(mut v: Vec<f32>) -> Result<Self> {
-    let norm_sq = {
-      let arr: &[f32; Self::EMBED_DIM] =
-        v.as_slice().try_into().map_err(|_| Error::EmbeddingDim {
-          expected: Self::EMBED_DIM,
-          got: v.len(),
-        })?;
-      crate::simd::dot_768(arr, arr)
-    };
+    let norm_sq = crate::simd::dot(&v, &v);
     let norm = norm_sq.sqrt();
     if !norm.is_finite() || (norm - 1.0).abs() > Self::NORM_EPSILON {
       return Err(Error::NotNormalized {
@@ -178,19 +178,6 @@ mod tests {
   }
 
   #[test]
-  fn try_from_rejects_wrong_dim() {
-    let v = vec![0.0; 100];
-    let err = Embedding::try_from(v).unwrap_err();
-    match err {
-      Error::EmbeddingDim { expected, got } => {
-        assert_eq!(expected, 768);
-        assert_eq!(got, 100);
-      }
-      _ => panic!("expected EmbeddingDim, got {err}"),
-    }
-  }
-
-  #[test]
   fn try_from_rejects_non_unit_norm() {
     let v = vec![0.5f32; 768];
     let err = Embedding::try_from(v).unwrap_err();
@@ -211,25 +198,6 @@ mod tests {
       "post-norm cosine should be 1.0; got {cos}"
     );
     assert!((e.as_slice()[0] - (1.0 / (768.0_f32).sqrt())).abs() < 1e-6);
-  }
-
-  /// The SIMD boundary takes `&[f32; 768]`, so a wrong-length slice
-  /// can never reach the unsafe kernels — `from_model_output` rejects
-  /// it at the conversion site with `Error::EmbeddingDim`. This test
-  /// pins the rejection path so a future refactor that re-loosens the
-  /// signature back to `&[f32]` would surface as a unit-test failure.
-  #[cfg(feature = "inference")]
-  #[test]
-  fn from_model_output_rejects_wrong_dim() {
-    let v = vec![0.5f32; 100];
-    let err = Embedding::from_model_output(&v).unwrap_err();
-    match err {
-      Error::EmbeddingDim { expected, got } => {
-        assert_eq!(expected, 768);
-        assert_eq!(got, 100);
-      }
-      _ => panic!("expected EmbeddingDim, got {err}"),
-    }
   }
 
   #[cfg(feature = "inference")]
@@ -286,26 +254,13 @@ mod tests {
     }
   }
 
-  /// `try_cosine` must also reject same-dim-but-non-768 pairs (the
-  /// `try_into::<&[f32; EMBED_DIM]>` failure path inside the kernel
-  /// boundary). This pair has matching dims (both 4), so the
-  /// dim-equality check passes, but the typed-array conversion still
-  /// fails — and `try_cosine` translates that into `EmbeddingDim`
-  /// rather than panicking.
+  /// With runtime dimensions, two equal-length-4 vectors are valid for
+  /// cosine — the old `try_into::<&[f32; 768]>` rejection no longer applies.
   #[test]
-  fn try_cosine_returns_dim_error_when_both_wrong_size() {
+  fn try_cosine_works_for_small_equal_dim() {
     let a = Embedding(vec![1.0f32, 0.0, 0.0, 0.0].into());
     let b = Embedding(vec![0.0f32, 1.0, 0.0, 0.0].into());
-    let err = a
-      .try_cosine(&b)
-      .expect_err("non-EMBED_DIM operands must error");
-    match err {
-      Error::EmbeddingDim { expected, got } => {
-        assert_eq!(expected, Embedding::EMBED_DIM);
-        assert_eq!(got, 4);
-      }
-      other => panic!("expected Error::EmbeddingDim, got {other}"),
-    }
+    assert_eq!(a.try_cosine(&b).expect("equal-dim cosine ok"), 0.0);
   }
 
   /// Happy path: when both operands are valid 768-d unit vectors,
@@ -336,5 +291,58 @@ mod tests {
   fn embedding_is_send_sync() {
     fn _req<T: Send + Sync>() {}
     _req::<Embedding>();
+  }
+
+  #[cfg(feature = "inference")]
+  #[test]
+  fn from_model_output_accepts_non_768_dims() {
+    for len in [128usize, 256, 512, 768] {
+      let v = unit_vec(len);
+      let e = Embedding::from_model_output(&v).expect("any unit-norm len ok");
+      assert_eq!(e.dim(), len);
+      assert!((e.try_cosine(&e).unwrap() - 1.0).abs() < 1e-4);
+    }
+  }
+
+  #[test]
+  fn try_from_accepts_non_768_unit_norm() {
+    let e = Embedding::try_from(unit_vec(256)).expect("256-d unit-norm ok");
+    assert_eq!(e.dim(), 256);
+  }
+
+  #[cfg(feature = "inference")]
+  #[test]
+  fn from_model_output_rejects_empty() {
+    let err = Embedding::from_model_output(&[]).unwrap_err();
+    assert!(matches!(err, Error::NotNormalized { .. }));
+  }
+
+  #[cfg(feature = "inference")]
+  #[test]
+  fn to_matryoshka_truncates_and_renormalizes() {
+    let e = Embedding::from_model_output(&unit_vec(768)).unwrap();
+    let m = e.to_matryoshka(256).expect("truncate to 256");
+    assert_eq!(m.dim(), 256);
+    assert!((m.try_cosine(&m).unwrap() - 1.0).abs() < 1e-4);
+  }
+
+  #[cfg(feature = "inference")]
+  #[test]
+  fn to_matryoshka_rejects_zero_and_too_large() {
+    let e = Embedding::from_model_output(&unit_vec(768)).unwrap();
+    assert!(e.to_matryoshka(0).is_err());
+    assert!(e.to_matryoshka(769).is_err());
+  }
+
+  #[test]
+  fn to_matryoshka_works_without_inference() {
+    // `to_matryoshka` is always-available (not inference-gated); build via
+    // `try_from` so this path is covered under `--no-default-features`.
+    let e = Embedding::try_from(unit_vec(768)).expect("768-d unit-norm");
+    let m = e.to_matryoshka(256).expect("truncate to 256");
+    assert_eq!(m.dim(), 256);
+    assert!((m.try_cosine(&m).unwrap() - 1.0).abs() < 1e-4);
+    assert!(e.to_matryoshka(0).is_err());
+    assert!(e.to_matryoshka(769).is_err());
   }
 }

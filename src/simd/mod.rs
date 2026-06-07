@@ -93,7 +93,6 @@ fn dot_768_dispatch(a: &[f32; 768], b: &[f32; 768]) -> f32 {
 /// Length-generic f32 dot product. Routes the common 768-d case through the
 /// hand-tuned [`dot_768`] fast path; every other length uses the safe scalar
 /// generic [`scalar::dot`]. Precondition: `a.len() == b.len()`.
-#[allow(dead_code)]
 #[cfg_attr(not(tarpaulin), inline(always))]
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
   debug_assert_eq!(a.len(), b.len(), "dot operands must have equal length");
