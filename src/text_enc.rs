@@ -74,6 +74,8 @@ enum TextBackend {
   Mlx {
     model: crate::mlx::MlxModel,
     tokenizer: Tokenizer,
+    #[cfg(feature = "windowing")]
+    windowing_tok: std::cell::OnceCell<Tokenizer>,
   },
 }
 
@@ -97,6 +99,8 @@ struct OrtTextEncoder {
   session: ort::session::Session,
   tokenizer: Tokenizer,
   opts: Options,
+  #[cfg(feature = "windowing")]
+  windowing_tok: std::cell::OnceCell<Tokenizer>,
 }
 
 impl TextEncoder {
@@ -148,6 +152,8 @@ impl TextEncoder {
         session,
         tokenizer,
         opts,
+        #[cfg(feature = "windowing")]
+        windowing_tok: std::cell::OnceCell::new(),
       }),
     })
   }
@@ -219,7 +225,12 @@ impl TextEncoder {
     let model = crate::mlx::MlxModel::from_dir(dir, opts.batch())?;
     let tokenizer = prepare_mlx_tokenizer(&dir.join("tokenizer.json"), opts.batch().max_seq_len())?;
     Ok(Self {
-      backend: TextBackend::Mlx { model, tokenizer },
+      backend: TextBackend::Mlx {
+        model,
+        tokenizer,
+        #[cfg(feature = "windowing")]
+        windowing_tok: std::cell::OnceCell::new(),
+      },
     })
   }
 
@@ -250,7 +261,12 @@ impl TextEncoder {
       opts.batch().max_seq_len(),
     )?;
     Ok(Self {
-      backend: TextBackend::Mlx { model, tokenizer },
+      backend: TextBackend::Mlx {
+        model,
+        tokenizer,
+        #[cfg(feature = "windowing")]
+        windowing_tok: std::cell::OnceCell::new(),
+      },
     })
   }
 
@@ -288,7 +304,12 @@ impl TextEncoder {
       opts.batch().max_seq_len(),
     )?;
     Ok(Self {
-      backend: TextBackend::Mlx { model, tokenizer },
+      backend: TextBackend::Mlx {
+        model,
+        tokenizer,
+        #[cfg(feature = "windowing")]
+        windowing_tok: std::cell::OnceCell::new(),
+      },
     })
   }
 
@@ -328,7 +349,12 @@ impl TextEncoder {
       opts.batch().max_seq_len(),
     )?;
     Ok(Self {
-      backend: TextBackend::Mlx { model, tokenizer },
+      backend: TextBackend::Mlx {
+        model,
+        tokenizer,
+        #[cfg(feature = "windowing")]
+        windowing_tok: std::cell::OnceCell::new(),
+      },
     })
   }
 
@@ -434,32 +460,53 @@ impl TextEncoder {
     Ok(())
   }
 
-  /// Return a non-truncating tokenizer clone and the encoder's `max_seq_len`.
+  /// Return a reference to the cached non-truncating tokenizer and the
+  /// encoder's `max_seq_len`.
   ///
   /// Both backends configure their tokenizers with truncation enabled (the ORT
   /// path via [`configure_tokenizer`], the MLX path via
-  /// [`configure_mlx_tokenizer`]). This helper clones the tokenizer and reads
-  /// `max_seq_len` off the truncation params before clearing them. The windowing
-  /// path uses the non-truncating clone to encode the full text; `max_seq_len`
-  /// bounds the per-window budget so each window stays within the model window.
+  /// [`configure_mlx_tokenizer`]). This helper reads `max_seq_len` off the
+  /// live truncating tokenizer's truncation params, then lazily initializes the
+  /// `windowing_tok` cache via `get_or_init` so the clone happens at most once
+  /// per encoder instance. The windowing path uses the non-truncating clone to
+  /// encode the full text; `max_seq_len` bounds the per-window budget so each
+  /// window stays within the model window.
   #[cfg(feature = "windowing")]
-  fn split_tokenizer(&self) -> (Tokenizer, usize) {
-    let raw = match &self.backend {
-      TextBackend::Ort(ort) => ort.tokenizer.clone(),
+  fn split_tokenizer(&self) -> (&Tokenizer, usize) {
+    match &self.backend {
+      TextBackend::Ort(ort) => {
+        // Read max_seq_len from the LIVE truncating tokenizer BEFORE the cache
+        // is populated — the non-truncating clone no longer carries these params.
+        let max_seq_len = ort
+          .tokenizer
+          .get_truncation()
+          .map(|t| t.max_length)
+          .unwrap_or(DEFAULT_MAX_SEQ_LEN);
+        let tok = ort.windowing_tok.get_or_init(|| {
+          let mut t = ort.tokenizer.clone();
+          let _ = t.with_truncation(None);
+          t
+        });
+        (tok, max_seq_len)
+      }
       #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
-      TextBackend::Mlx { tokenizer, .. } => tokenizer.clone(),
-    };
-    // Read max_seq_len from the tokenizer's truncation params BEFORE clearing
-    // them. Both backends set truncation at construction with `max_length =
-    // opts.batch().max_seq_len()`, so this is the authoritative source.
-    let max_seq_len = raw
-      .get_truncation()
-      .map(|t| t.max_length)
-      .unwrap_or(DEFAULT_MAX_SEQ_LEN);
-    // Disable truncation so the clone tokenizes the full text for windowing.
-    let mut tok = raw;
-    let _ = tok.with_truncation(None);
-    (tok, max_seq_len)
+      TextBackend::Mlx {
+        tokenizer,
+        windowing_tok,
+        ..
+      } => {
+        let max_seq_len = tokenizer
+          .get_truncation()
+          .map(|t| t.max_length)
+          .unwrap_or(DEFAULT_MAX_SEQ_LEN);
+        let tok = windowing_tok.get_or_init(|| {
+          let mut t = tokenizer.clone();
+          let _ = t.with_truncation(None);
+          t
+        });
+        (tok, max_seq_len)
+      }
+    }
   }
 
   /// Embed a long `text` as overlapping windows (see [`crate::WindowOptions`]).
@@ -487,8 +534,9 @@ impl TextEncoder {
     let max_windows = self.backend.max_batch_size();
     // Byte-exact: each window embeds the original encoding's token IDs verbatim,
     // so the byte span describes exactly the tokens embedded.
-    let windows =
-      crate::window::fixed_token_id_windows(&tok, text, opts, max_seq_len, max_windows)?;
+    // tok's last use is inside fixed_token_id_windows (which returns owned windows),
+    // so NLL releases the &self borrow before the &mut self embed_id_rows call below.
+    let windows = crate::window::fixed_token_id_windows(tok, text, opts, max_seq_len, max_windows)?;
     if windows.is_empty() {
       return Ok(Vec::new());
     }
@@ -526,8 +574,7 @@ impl TextEncoder {
     }
     let (tok, max_seq_len) = self.split_tokenizer();
     let max_windows = self.backend.max_batch_size();
-    let windows =
-      crate::window::fixed_token_id_windows(&tok, text, opts, max_seq_len, max_windows)?;
+    let windows = crate::window::fixed_token_id_windows(tok, text, opts, max_seq_len, max_windows)?;
     let rows: Vec<Vec<u32>> = windows.iter().map(|(_, ids, _)| ids.clone()).collect();
     let embs = self.embed_id_rows(&rows)?;
     // Weight each window by its REAL content-token count (the third tuple field),
