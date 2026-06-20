@@ -4,6 +4,21 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// Which phase of the MLX backend produced an [`Error::Mlx`]: reading/validating
+/// the checkpoint config, loading weights, or the inference forward pass. Lets
+/// callers branch (e.g. retry `Runtime`, fail-fast `Config`) even though the
+/// underlying `mlxrs::Error` text is opaque.
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlxErrorKind {
+  /// Config read / parse / `Gemma3Config::validate`.
+  Config,
+  /// Weight load / `sanitize` / `from_weights` / pooling-config read.
+  Load,
+  /// Inference: tensor build, `encode_text`, eval, or output-shape extraction.
+  Runtime,
+}
+
 /// All errors surfaced from the public API.
 ///
 /// `#[non_exhaustive]` so that adding variants in a future minor
@@ -77,13 +92,14 @@ pub enum Error {
     got: ort::value::TensorElementType,
   },
 
-  /// `Embedding` constructed from a `Vec<f32>` whose length didn't
-  /// equal [`crate::Embedding::EMBED_DIM`] (768).
+  /// An embedding dimension didn't match the expected dimension (e.g.
+  /// `try_cosine` operands of differing length, or `to_matryoshka` given a
+  /// `dim` larger than the source).
   #[error("embedding dimension mismatch: expected {expected}, got {got}")]
   EmbeddingDim {
-    /// Required dim (always 768 in 0.1.0).
+    /// The dimension that was required/compared against.
     expected: usize,
-    /// Caller-supplied dim.
+    /// The actual dimension supplied.
     got: usize,
   },
 
@@ -114,6 +130,19 @@ pub enum Error {
     got: usize,
     /// Configured upper bound.
     max: usize,
+  },
+
+  /// A specific [`crate::options::Backend`] was requested via
+  /// [`crate::Options::with_backend`] but cannot be honored — e.g.
+  /// [`Backend::Mlx`](crate::options::Backend::Mlx) on a non-Apple-Silicon
+  /// target, or when the directory holds no checkpoint for the requested
+  /// backend.
+  #[error("requested backend {requested:?} is unavailable: {reason}")]
+  BackendUnavailable {
+    /// The backend the caller asked for.
+    requested: crate::options::Backend,
+    /// Why it could not be honored.
+    reason: String,
   },
 
   /// `BatchOptions::batch_size` was outside the legal range
@@ -156,6 +185,67 @@ pub enum Error {
   /// file).
   #[error(transparent)]
   Io(#[from] std::io::Error),
+
+  /// Error from the MLX (`mlxrs`) inference backend — checkpoint load,
+  /// tokenization, or the bidirectional backbone / Dense-head forward pass.
+  /// Compiled only on the Apple-Silicon target (the only place the backend
+  /// exists). The `mlxrs::Error` is captured as its `Display` string so this
+  /// crate's public `Error` does not leak the `mlxrs` type into its API.
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+  #[error("mlx backend {kind:?} error: {message}")]
+  Mlx {
+    /// Which phase of the backend failed.
+    kind: MlxErrorKind,
+    /// Human-readable description of the MLX backend failure.
+    message: String,
+  },
+
+  /// `Vec::try_reserve_exact` returned an error — the global allocator could
+  /// not satisfy a text-batch scratch request on the MLX path. Surfaced as a
+  /// typed error rather than a process abort. `requested_bytes` helps callers
+  /// tell whether they hit a cap they chose versus system memory pressure.
+  ///
+  /// `cause` is named (not `source`) because `TryReserveError` does not
+  /// implement `std::error::Error` on stable Rust today, so its `Display` is
+  /// captured as a string. Compiled only on the Apple-Silicon target (the only
+  /// place the MLX backend exists).
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+  #[error("failed to allocate {requested_bytes} bytes for `{which}` scratch buffer: {cause}")]
+  AllocationFailed {
+    /// Buffer the allocator was asked to reserve.
+    which: &'static str,
+    /// Number of bytes that were requested.
+    requested_bytes: usize,
+    /// `Display` representation of the underlying `TryReserveError`.
+    cause: String,
+  },
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+impl Error {
+  /// Build an [`Error::Mlx`] from a static reason string.
+  pub(crate) fn mlx(kind: MlxErrorKind, reason: &'static str) -> Self {
+    Error::Mlx {
+      kind,
+      message: reason.to_string(),
+    }
+  }
+
+  /// Build an [`Error::Mlx`] from an owned reason string.
+  pub(crate) fn mlx_owned(kind: MlxErrorKind, reason: String) -> Self {
+    Error::Mlx {
+      kind,
+      message: reason,
+    }
+  }
+
+  /// Convert an `mlxrs::Error` into [`Error::Mlx`], capturing its `Display`.
+  pub(crate) fn from_mlx(kind: MlxErrorKind, source: mlxrs::Error) -> Self {
+    Error::Mlx {
+      kind,
+      message: source.to_string(),
+    }
+  }
 }
 
 /// Crate-local `Result` alias parameterized on the [`Error`](enum@Error)
@@ -192,5 +282,26 @@ mod tests {
       err.to_string(),
       "embedding dimension mismatch: expected 768, got 512"
     );
+  }
+
+  #[test]
+  fn backend_unavailable_displays_requested_and_reason() {
+    let e = Error::BackendUnavailable {
+      requested: crate::options::Backend::Mlx,
+      reason: "not apple silicon".to_string(),
+    };
+    let msg = e.to_string();
+    assert!(msg.contains("Mlx"), "got {msg:?}");
+    assert!(msg.contains("not apple silicon"), "got {msg:?}");
+  }
+
+  #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+  #[test]
+  fn mlx_error_displays_kind_and_message() {
+    let e = Error::Mlx {
+      kind: MlxErrorKind::Runtime,
+      message: "boom".to_string(),
+    };
+    assert_eq!(e.to_string(), "mlx backend Runtime error: boom");
   }
 }

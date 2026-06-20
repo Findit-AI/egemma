@@ -6,4 +6,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0]
+
+### Changed (breaking)
+
+- `Error::Mlx(String)` is now `Error::Mlx { kind: MlxErrorKind, message: String }`.
+- MLX backend now truncates inputs longer than `max_seq_len` (default 2048);
+  previously the MLX path did not truncate. Use the `windowing` feature for
+  full long-input coverage.
+- `Embedding` is now runtime-dimensioned: `Embedding::EMBED_DIM` is removed
+  (use `Embedding::dim()`; `Embedding::DEFAULT_DIM` documents the 768 base).
+  `from_model_output` / `TryFrom<Vec<f32>>` accept any non-empty unit-norm
+  length, enabling Matryoshka (128/256/512) checkpoints end-to-end.
+
+### Added
+
+- MLX (`mlxrs`) Metal inference backend behind the opt-in `mlx` feature (Apple
+  Silicon only, **off by default**). `TextEncoder::from_dir` auto-routes to it
+  when an MLX checkpoint is present; explicit `from_safetensors` (and the
+  feature-gated `from_npz` / `from_gguf`) load a known MLX weight file. The
+  default build — including on Apple Silicon — stays ONNX-only, so `TextEncoder`
+  remains `Send`; enable `--features mlx` for the Metal backend.
+- `Backend` selector (`Auto`/`Onnx`/`Mlx`) on `Options` via `with_backend`.
+- `TextEncoder::from_dir_with_options`, `from_safetensors_with_options`, and
+  (feature-gated) `from_npz_with_options` / `from_gguf_with_options`.
+- `Error::BackendUnavailable` for an unsatisfiable forced backend.
+- `MlxErrorKind { Config, Load, Runtime }` tags on MLX failures.
+- `Embedding::to_matryoshka(dim)` — prefix-truncate + renormalize a 768-d
+  embedding to a shorter Matryoshka dimension.
+- `Embedding::DEFAULT_DIM` — documentation constant for the 768 base-export
+  dimension (replaces the removed `EMBED_DIM`).
+- `windowing` feature (off by default): `TextEncoder::embed_windows` (per-window
+  vectors) and `embed_pooled` (token-weighted mean) for inputs longer than the
+  model window. Byte-exact fixed-token windows (`WindowOptions` with configurable
+  size/overlap) that embed the original token IDs verbatim — no re-tokenization,
+  no silent truncation. Enable with `--features windowing`.
+
+## [0.1.0]
+
 Initial release. See `Cargo.toml` for the public surface.

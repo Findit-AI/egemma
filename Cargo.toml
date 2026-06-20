@@ -1,6 +1,6 @@
 [package]
 name         = "egemma"
-version      = "0.1.0"
+version      = "0.2.0"
 edition      = "2024"
 rust-version = "1.95"
 description  = "Rust ONNX inference library for Google's EmbeddingGemma (text embeddings)"
@@ -40,6 +40,24 @@ serde      = { version = "1", features = ["derive"], optional = true }
 [dev-dependencies]
 serde_json = "1"
 
+# ── MLX (mlxrs) inference backend — Apple Silicon only, opt-in ──────────
+#
+# `mlxrs` binds the Metal-backed MLX C++ runtime through `mlx-c` FFI and
+# only builds on `aarch64-apple-darwin`, so it is declared under a target
+# table — it never enters the dependency graph on any other host. It is
+# **optional** and activated by the opt-in `mlx` feature (which adds `dep:mlxrs`
+# on this target). It is NOT pulled by `inference`, so a default build — even on
+# Apple Silicon — compiles neither `mlxrs` nor the MLX backend, and the
+# `TextEncoder` stays `Send`. With `mlx` on, `TextEncoder::from_dir` auto-routes
+# to MLX when an MLX checkpoint is present and falls back to ONNX; the
+# `embeddinggemma` feature gives the Gemma3 backbone + mean pooling + Dense head.
+#
+# Build-cost note: a macOS/arm64 build that enables `mlx` compiles `mlxrs`, which
+# builds the MLX C++/Metal runtime from source on a cold target directory; builds
+# without `mlx` never pay it.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+mlxrs = { git = "https://github.com/Findit-AI/mlxrs", branch = "main", default-features = false, features = ["embeddinggemma"], optional = true }
+
 # =====================================================================
 # Target / feature contract.
 #
@@ -63,16 +81,54 @@ serde_json = "1"
 # =====================================================================
 [features]
 default   = ["inference"]
-# Activates the ONNX-backed inference path (`TextEncoder`). Native
-# targets only — see the target / feature contract block above for the
-# wasm escape hatch.
+# Widen which weight FORMATS the opt-in MLX (`mlxrs`) backend accepts on Apple
+# Silicon. Each IMPLIES the `mlx` feature (a weight-format widener is meaningless
+# without the backend) and enables the matching `mlxrs` feature. With `mlx` (and
+# one of these) on, the loader's format detector additionally probes a
+# `*.npz`/`*.gguf` and the backend probe routes such a dir to MLX. `mlxrs` is a
+# macOS-arm64-only target dependency, so on every other target the `mlxrs/<fmt>`
+# activation is a harmless no-op (the npz/gguf detection code is itself
+# `#[cfg(feature = ...)]`-gated, so it isn't compiled). (gguf is a weight load
+# seam: its embedded metadata is not mapped to a config — a `config.json` is
+# still required alongside it.)
+npz       = ["mlx", "mlxrs?/npz"]
+gguf      = ["mlx", "mlxrs?/gguf"]
+# Activates the ONNX (`ort`) inference path (`TextEncoder`) on every native
+# target. The MLX (`mlxrs`) backend is a SEPARATE opt-in feature (`mlx`, below) —
+# `inference` no longer pulls `mlxrs`, so the default Apple-Silicon build is
+# ONNX-only and its `TextEncoder` stays `Send`. Native targets only — see the
+# target / feature contract block above for the wasm escape hatch.
 inference = ["dep:ort", "dep:tokenizers"]
+
+# Opt-in MLX (`mlxrs`) Metal backend — Apple Silicon only, OFF by default.
+# Enabling it activates `dep:mlxrs` (a no-op on every non-`aarch64-apple-darwin`
+# target, where `mlxrs` is not a dependency) and compiles the MLX backend into
+# `TextEncoder`, which `from_dir` then auto-routes to when an MLX checkpoint is
+# present. Implies `inference` (it reuses the same tokenizer text path). NOTE:
+# because the MLX model holds an `Rc`-backed Metal handle, a `TextEncoder` built
+# with `mlx` ON is `!Send` on Apple Silicon (even ONNX-backed instances — an enum
+# is `Send` only if all variants are); leave `mlx` OFF for a `Send` ONNX encoder
+# on that platform. This is the deliberate, documented trade-off for the opt-in
+# Metal backend.
+mlx       = ["inference", "dep:mlxrs"]
 # Pulls the `serde` dependency and activates `Serialize` / `Deserialize`
 # on `Options`, `BatchOptions`, and `ThreadOptions`. `Embedding`
 # deliberately does NOT carry these derives — round-trip via the inner
 # slice (see `Embedding` docs) so the dim and L2-norm invariants that
 # `TryFrom<Vec<f32>>` exists to enforce can't be bypassed.
 serde     = ["dep:serde"]
+# Long-input sliding-window support (`TextEncoder::embed_windows` / `embed_pooled`):
+# byte-exact fixed-token windows that embed the original token IDs verbatim (no
+# re-tokenization, no silent truncation). Off by default. Implies `inference` (it
+# windows around the inference text path).
+windowing = ["inference"]
+# Backend selection: the ONNX (`ort`) backend is always compiled with
+# `inference`; the MLX (`mlxrs`) Metal backend is the opt-in `mlx` feature above
+# (Apple Silicon only). With `mlx` on, `TextEncoder::from_dir` auto-routes to MLX
+# when an MLX checkpoint is present and falls back to ONNX; a forced
+# `Backend::Mlx` without the feature (or off Apple Silicon) returns
+# `Error::BackendUnavailable`. Off Apple Silicon the `mlx` feature is inert (the
+# `mlxrs` target dependency does not exist there).
 
 # ----- Opt-in execution providers --------------------------------------
 #
@@ -117,7 +173,7 @@ rpath             = false
 # the docs build even when the actual code on docs.rs is fine. List
 # the features that compile on a stock Linux runner; EP-specific docs
 # coverage would need a separately provisioned builder.
-features = ["inference", "serde"]
+features = ["inference", "serde", "windowing"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
